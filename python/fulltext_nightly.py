@@ -22,6 +22,8 @@ Stages, in order (each is its own summary row):
   g. parse         fulltext_parse.py --to-db --symbols-file <exact run manifest>
   h. gate          fulltext_verify_text.py --symbols <tonight's docx docs>
                    fulltext_verify_pdf.py  --symbols <tonight's pdf docs>
+  i. volume-split  recover newly published decision-volume children
+  j. metrics       fulltext_metrics.py --symbols-file <exact parsed manifest>
 
 Exit code: 0 only if NO conversion was blocked, ALL gates passed, and no stage
 subprocess failed. A blocked conversion NEVER exits early — every remaining
@@ -109,6 +111,16 @@ def extracted_rows() -> set[tuple[str, str]]:
             "WHERE lang = 'en' AND status = 'extracted'"
         )
         return {(s, f) for s, f in cur.fetchall()}
+
+
+def parsed_symbols() -> set[str]:
+    """English symbols currently carrying a successful semantic parse."""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT symbol_normalized FROM digitallibrary.document_files "
+            "WHERE lang = 'en' AND status = 'parsed'"
+        )
+        return {row[0] for row in cur.fetchall()}
 
 
 def write_symbols_manifest(path: Path, symbols: list[str]) -> None:
@@ -341,10 +353,31 @@ def main() -> int:
     # present and the split's sha256-gate skips unchanged volumes, so this is a
     # cheap no-op on a night with no new supplement. Early-HRC Word reports are a
     # one-time local backfill (LibreOffice-dependent), not part of the nightly.
-    vol_before = n_status(snapshot(), "parsed")
+    vol_before_symbols = parsed_symbols()
     rc, dt = run_stage("volume-split", "python/fulltext_split_volumes.py", ["--nightly"])
     record("volume-split", rc, dt)
-    metrics["volume_children_parsed"] = max(0, n_status(snapshot(), "parsed") - vol_before)
+    volume_symbols = parsed_symbols() - vol_before_symbols
+    metrics["volume_children_parsed"] = len(volume_symbols)
+
+    # -- j. deterministic text metrics --------------------------------------
+    # The manifest remains identity-based: only documents successfully parsed
+    # by this run (ordinary targets plus newly split volume children) are
+    # considered. fulltext_metrics independently re-checks the parsed ledger,
+    # so a parse refusal can never acquire a metric.
+    metric_symbols = sorted(set(run_symbols) | volume_symbols)
+    write_symbols_manifest(manifest, metric_symbols)
+    if metric_symbols:
+        metrics_summary = ARCHIVE_ROOT / "run_manifests" / "text-metrics.json"
+        rc, dt = run_stage(
+            "text-metrics",
+            "python/fulltext_metrics.py",
+            ["--symbols-file", str(manifest), "--summary-json", str(metrics_summary)],
+        )
+        record("text-metrics", rc, dt)
+        metrics["metric_targets"] = len(metric_symbols)
+    else:
+        results.append(("text-metrics", "skipped", 0.0))
+        metrics["metric_targets"] = 0
 
     # -- stage summary table -------------------------------------------------
     print("\n=== stage summary ===")
@@ -365,6 +398,7 @@ def main() -> int:
     print(f"  extracted              : {metrics['extracted']}")
     print(f"  parsed                 : {metrics['parsed']}")
     print(f"  volume children parsed : {metrics.get('volume_children_parsed', 0)}")
+    print(f"  text metric targets     : {metrics.get('metric_targets', 0)}")
     print(f"  gates                  : {gate_str}")
     print(f"  absences recorded      : {metrics['absences_recorded']}")
 

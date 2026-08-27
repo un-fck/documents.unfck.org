@@ -167,3 +167,27 @@ CREATE TABLE IF NOT EXISTS digitallibrary.document_parses (
   parsed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (symbol_normalized, lang)
 );
+
+-- ---------------------------------------------------------------------------
+-- Versioned deterministic metrics over the successful semantic parse.
+-- Populated by python/fulltext_metrics.py. token_text is the exact normalized
+-- word-token stream counted here and consumed by downstream series similarity.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS digitallibrary.document_text_metrics (
+  symbol_normalized    TEXT        NOT NULL,
+  lang                 TEXT        NOT NULL DEFAULT 'en',
+  text_profile_version TEXT        NOT NULL,
+  metric_version       TEXT        NOT NULL,
+  parser_version       TEXT        NOT NULL,
+  content_sha256       TEXT        NOT NULL CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+  word_count           INTEGER     NOT NULL CHECK (word_count >= 0),
+  character_count      INTEGER     NOT NULL CHECK (character_count >= 0),
+  element_count        INTEGER     NOT NULL CHECK (element_count >= 0),
+  token_text           TEXT        NOT NULL,
+  computed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (symbol_normalized, lang, text_profile_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_text_metrics_current
+  ON digitallibrary.document_text_metrics
+    (text_profile_version, lang, symbol_normalized);

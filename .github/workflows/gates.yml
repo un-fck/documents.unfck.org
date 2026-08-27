@@ -49,6 +49,8 @@ jobs:
         run: uv run python python/fulltext_verify_volumes.py --self-test
       - name: split_volumes self-test
         run: uv run python python/fulltext_split_volumes.py --self-test
+      - name: deterministic text metrics unit tests
+        run: uv run python -m unittest discover -s python/tests -p 'test_*.py' -v
 
       # A baseline file is a claim about the corpus. If it is missing, every
       # finding is untriaged and the gates that read it are red by construction —

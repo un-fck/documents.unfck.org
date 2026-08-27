@@ -17,11 +17,40 @@ from **semantic interpretation**:
    extraction layer. Document-ordered paragraphs with just enough structure
    (numbering, styles, italics/bold, indentation, table cells, hyperlinks,
    footnotes) to reconstruct meaning later, but **no** semantic labelling.
-3. **Semantic layer — not built yet.** Normalized preambular/operative
+3. **Semantic layer.** Normalized preambular/operative
    paragraphs, mandate objects, cross-references, etc. will land as
-   **migration `003`** *after* we iterate on the raw layer and learn what the
-   documents actually look like across the format eras. Building it now would
-   bake in guesses.
+   **migration `003`**.
+4. **`digitallibrary.document_text_metrics`** — a versioned, derived metric row
+   for each successfully parsed English document. It is disposable and can be
+   rebuilt from the semantic layer.
+
+## Canonical text metrics
+
+`python/fulltext_metrics.py` defines the canonical `substantive-v1` profile used
+for document word length and recurrence-series comparisons. It uses only
+`digitallibrary.document_paragraphs`; legacy Mandates text and raw PDF-to-text
+are never inputs.
+
+Included semantic elements are title, opening formula, heading, paragraph and
+table, across main text, annexes and appendices. Frontmatter/mastheads, page
+boilerplate, footnotes, dividers, vote records and signatures are excluded.
+Words are deterministic Unicode letter/number runs with an optional internal
+apostrophe. Numbers and meaningful one-character words are retained. The
+NFKC/case-folded token stream is stored alongside its SHA-256, parser version,
+profile/metric versions and timestamp; this gives downstream comparison jobs an
+exact input and makes unchanged nightly upserts no-ops.
+
+Apply migration 006, then backfill once:
+
+```bash
+psql "$DATABASE_URL" -f sql/migrations/006_document_text_metrics.sql
+uv run python python/fulltext_metrics.py --all
+```
+
+The 03:00 nightly runs the same command against its exact-symbol manifest after
+ordinary parses and volume-split children. Explicit repair/backfill scopes are
+also supported with `--symbols ...` or `--symbols-file path`. Re-running is safe;
+rollback is simply dropping the derived table and removing the metrics stage.
 
 The re-parse philosophy: **the SSD archive is ground truth**, and
 `document_paragraphs_raw` is a disposable re-parse substrate. Any extractor bug
