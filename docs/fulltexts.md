@@ -268,26 +268,33 @@ uv run python python/fulltext_extract_raw.py --force    # also re-extract 'extra
 
 ### 6. Semantic parse → JSON + semantic DB
 
-`python/fulltext_parse.py` (parser_version `sem-v2`) classifies the raw rows into
+`python/fulltext_parse.py` (currently parser_version `sem-v5`) classifies the raw rows into
 semantic elements **and annotates each operative/preambular element with its action
 verb** (see *Action-verb annotation (migration 004)* below). It always writes one
 JSON per doc to `parsed_dev/`; with `--to-db` it *also* loads the two semantic tables
-(migrations 003 + 004 columns) and advances status `extracted → parsed` (hard
-failures `parse_failed`). It targets docs with status `extracted` **or** `parsed`, so
-a re-parse still finds already-loaded docs.
+(migrations 003 + 004 columns) and advances status `extracted → parsed`. Its safe
+default targets only `extracted` rows. Existing `parsed` rows are admitted only
+with `--reparse` plus an explicit symbol or symbol manifest.
 
 ```bash
 uv run python python/fulltext_parse.py                  # JSON only (parsed_dev/*.json)
 uv run python python/fulltext_parse.py --to-db          # JSON + semantic DB
 uv run python python/fulltext_parse.py --db-only        # semantic DB only, skip JSON
-uv run python python/fulltext_parse.py --symbol A/RES/48/75 --to-db
+uv run python python/fulltext_parse.py --symbols-file tonight.txt --to-db
+uv run python python/fulltext_parse.py --symbol A/RES/48/75 --reparse --to-db
 ```
 
 Loading is **delete-then-insert per `(symbol_normalized, lang)`** in both tables,
-batched over short-lived ~20-doc connections — idempotent and safe to re-run. An
-accounting failure does not fail the load (the doc is still written and the
-failure recorded in `document_parses.issues`); only a Python parse/insert
-exception yields `parse_failed`.
+batched over short-lived ~20-doc connections. Before any DB mutation, every
+target's archived source must exist and its archived-original sha256 must match
+the ledger. Accounting, source-conservation and overreach checks then run before
+the delete/insert transaction. A rejected new extraction becomes `parse_failed`
+without semantic rows; a rejected explicit reparse preserves the last good rows
+and `parsed` status.
+
+An empty `--symbols-file` means **zero work**. It never falls back to the default
+queue. Corpus-wide reparsing is intentionally not a default CLI mode: construct
+and review an explicit manifest on a host with the persistent archive.
 
 ### 7. Full top-up cycle (orchestrator)
 
@@ -329,12 +336,20 @@ CI failure semantics.
 | d | convert | native docx flagged in-process; `fulltext_convert.py` **iff** doc/wpd waiting **and** soffice present | see below |
 | e | extract | `fulltext_extract_raw.py` | `status='converted'` → `extracted` |
 | f | extract-pdf | `fulltext_extract_pdf.py` | `status='fetched'` pdf → `extracted` |
-| g | parse | `fulltext_parse.py --to-db --limit <newly-extracted + 50>` | extracted-first, so it targets tonight's docs |
+| g | parse | `fulltext_parse.py --to-db --symbols-file <run manifest>` | exact symbols that changed from a non-extracted status to `extracted` in this run |
 | h | gate | `fulltext_verify_text.py --symbols <tonight's docx docs>` + `fulltext_verify_pdf.py --symbols <tonight's pdf docs>` | text-preservation acceptance |
 
 Each stage prints its own summary row; a final **night summary** reports `new`,
 `rechecked-rescued`, `pdf-fallback-rescued`, `converted`/blocked, `extracted`,
 `parsed`, gate pass/fail, and absences recorded.
+
+The run manifest carries document identities, not merely a count. Pre-existing
+`extracted` backlog and every `parsed` document are excluded. The same exact list
+feeds parsing and the Word/PDF gates. This is required because the CI archive is
+ephemeral: it contains tonight's downloads, not historical source files.
+Every run also writes `run_manifests/nightly-result.json`; GitHub Actions uploads
+that result, the exact manifests and any rejected parse JSON for 30 days even
+when the pipeline fails.
 
 `--recheck-recent-days N` / `--fallback-recent N` select `unavailable` rows whose
 document `date_publication` is within N days — deliberately publication-date-only.
@@ -668,12 +683,14 @@ uv run python python/fulltext_convert.py
 uv run python python/fulltext_extract_pdf.py --symbols <ga/ecosoc vols>   # PDF
 uv run python python/fulltext_extract_raw.py --symbols <hrc reports>      # docx
 
-# 3. Split — write child raw rows + child ledger rows; retire the volume to 'split'.
-uv run python python/fulltext_split_volumes.py --split
+# 3. Split — write child raw rows + exact child/parent manifests; retire the volume.
+uv run python python/fulltext_split_volumes.py --split \
+  --changed-symbols-out /tmp/volume-children.txt \
+  --changed-volumes-out /tmp/changed-volumes.txt
 uv run python python/fulltext_split_volumes.py --split --symbols 'A/80/49(VOL.II)' --dry-run
 
-# 4. Parse the children (ordinary parse; children are status='extracted'):
-uv run python python/fulltext_parse.py --to-db
+# 4. Parse exactly the changed children. An empty manifest is a safe no-op:
+uv run python python/fulltext_parse.py --to-db --symbols-file /tmp/volume-children.txt
 
 # 5. Volume acceptance gate:
 uv run python python/fulltext_verify_volumes.py
@@ -682,9 +699,11 @@ uv run python python/fulltext_verify_volumes.py
 Iterate per the project discipline: after the first volume of a type, eyeball a
 few children (`fulltext_review.py --symbols A/DEC/80/506 ...`) before the bulk.
 The **nightly** runs the GA/ECOSOC track (`--nightly`, PDF-only, CI-safe) as a
-late stage; the sha256-gate (`harvest_state` key `volume_splits`) makes it a cheap
-no-op until DL harvests a new supplement. The HRC track is a one-time local
-backfill (LibreOffice-dependent, historical set), not part of the nightly.
+late stage. The sha256-gate (`harvest_state` key `volume_splits`) writes empty
+manifests and skips parse/verify until DL harvests a new supplement. When a
+volume changes, only its exact child manifest is parsed and only its exact parent
+manifest is verified. The HRC track is a one-time local backfill
+(LibreOffice-dependent, historical set), not part of the nightly.
 
 ## Coverage snapshot (2026-07-22)
 

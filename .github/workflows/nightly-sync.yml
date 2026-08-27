@@ -41,3 +41,14 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FULLTEXT_ARCHIVE_ROOT: ${{ runner.temp }}/fulltext-archive
         run: uv run python python/fulltext_nightly.py
+
+      - name: Publish fulltext run manifests and rejected parses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fulltext-nightly-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/fulltext-archive/run_manifests
+            ${{ runner.temp }}/fulltext-archive/parsed_dev/_failed

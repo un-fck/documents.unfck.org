@@ -1446,7 +1446,8 @@ def controls_nightly() -> None:
     # BASELINE: a night that DOES work and whose text gate fails must exit non-zero.
     patch = (stub_common
              + "m.snapshot = lambda: {('extracted','docx'): 5}\n"
-             + "m.extracted_symbols = lambda: (['S/RES/2825(2026)'], [])\n")
+             + "rows = iter([set(), {('S/RES/2825(2026)', 'docx')}])\n"
+             + "m.extracted_rows = lambda: next(rows, set())\n")
     rc, out = run_gate(NIG, [], {**env_adv(archive=arch), "ADV_FAIL_STAGE": "gate-text"},
                        inproc_patch=patch)
     record(judge(Control("N-GATE-FAILURE", "nightly",
@@ -1457,7 +1458,7 @@ def controls_nightly() -> None:
     # (source blocked every fetch / a selection bug produced nothing).
     patch = (stub_common
              + "m.snapshot = lambda: {}\n"
-             + "m.extracted_symbols = lambda: ([], [])\n")
+             + "m.extracted_rows = lambda: set()\n")
     rc, out = run_gate(NIG, [], env_adv(archive=arch), inproc_patch=patch)
     record(judge(Control("N-ZERO-WORK-NIGHT", "nightly",
                          "0 documents reach status='extracted' — no gate runs at all",

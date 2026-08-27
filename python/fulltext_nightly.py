@@ -19,7 +19,7 @@ Stages, in order (each is its own summary row):
                    fail at the very end).
   e. extract       fulltext_extract_raw.py   (status='converted' -> 'extracted')
   f. extract-pdf   fulltext_extract_pdf.py   (status='fetched' pdf -> 'extracted')
-  g. parse         fulltext_parse.py --to-db --limit <newly extracted + 50>
+  g. parse         fulltext_parse.py --to-db --symbols-file <exact run manifest>
   h. gate          fulltext_verify_text.py --symbols <tonight's docx docs>
                    fulltext_verify_pdf.py  --symbols <tonight's pdf docs>
 
@@ -39,9 +39,10 @@ Design notes (see docs/fulltexts.md → Nightly automation):
     from ARCHIVE_ROOT/parsed_dev, so the JSON must be written (it is ephemeral
     runner-temp in CI, consumed immediately by stage h in the same job).
   * The archive on CI is runner-temp and ephemeral. Files fetched tonight ARE
-    present, so tonight's docs can be gated; older docs are already 'parsed' and
-    are not re-touched. The DB is authoritative; the SSD archive is brought up
-    to date locally with `fulltext_fetch.py --sync-archive`.
+    present, so tonight's exact symbol manifest can be parsed and gated. Existing
+    parsed docs and pre-existing extracted backlog are never selected implicitly.
+    The DB is authoritative; the SSD archive is brought up to date locally with
+    `fulltext_fetch.py --sync-archive`.
 
 Usage:
     uv run python python/fulltext_nightly.py
@@ -51,6 +52,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -66,7 +68,6 @@ WORD_FORMATS = ("docx", "doc", "wpd")
 RECENT_DAYS = 45
 FETCH_NEW_RATE = "1.5"
 PDF_FALLBACK_RATE = "1.8"
-PARSE_MARGIN = 50  # parse --limit = (newly extracted) + this
 
 
 # ---------------------------------------------------------------------------
@@ -100,18 +101,29 @@ def n_status(snap: dict, status: str, formats: tuple[str, ...] | None = None) ->
               if s == status and (formats is None or f in formats))
 
 
-def extracted_symbols() -> tuple[list[str], list[str]]:
-    """(word_syms, pdf_syms) — symbol_normalized values currently status='extracted',
-    split by path. These are exactly this run's parse targets (extracted-first)."""
+def extracted_rows() -> set[tuple[str, str]]:
+    """English (symbol, format) rows currently at status='extracted'."""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT symbol_normalized, format FROM digitallibrary.document_files "
             "WHERE lang = 'en' AND status = 'extracted'"
         )
-        rows = cur.fetchall()
-    word = [s for s, f in rows if f in WORD_FORMATS]
-    pdf = [s for s, f in rows if f == "pdf"]
-    return word, pdf
+        return {(s, f) for s, f in cur.fetchall()}
+
+
+def write_symbols_manifest(path: Path, symbols: list[str]) -> None:
+    """Atomically write exact targets; an empty manifest means no work."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("".join(f"{symbol}\n" for symbol in sorted(set(symbols))),
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def newly_extracted(before: set[tuple[str, str]],
+                    after: set[tuple[str, str]]) -> set[tuple[str, str]]:
+    """Identity-based run delta; pre-existing backlog is intentionally excluded."""
+    return after - before
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +170,26 @@ def _self_test() -> int:
             ok = False
         print(f"  decide_convert(pending_docwpd={pending}, soffice={soffice}) "
               f"-> {got!r} (want {want!r}) [{flag}]")
+    before = {("OLD", "pdf")}
+    after = before | {("NEW-WORD", "docx"), ("NEW-PDF", "pdf")}
+    got_delta = newly_extracted(before, after)
+    want_delta = {("NEW-WORD", "docx"), ("NEW-PDF", "pdf")}
+    if got_delta != want_delta:
+        ok = False
+        print(f"  FAIL exact extraction delta: got {got_delta}, want {want_delta}")
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = Path(tmp) / "symbols.txt"
+        write_symbols_manifest(manifest, ["S/RES/2", "A/RES/1", "S/RES/2"])
+        got_manifest = manifest.read_text(encoding="utf-8")
+        if got_manifest != "A/RES/1\nS/RES/2\n":
+            ok = False
+            print(f"  FAIL exact manifest: {got_manifest!r}")
+        write_symbols_manifest(manifest, [])
+        if manifest.read_text(encoding="utf-8") != "":
+            ok = False
+            print("  FAIL empty manifest was not empty")
     print("self-test:", "PASS" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -252,7 +284,7 @@ def main() -> int:
     metrics["blocked_docwpd"] = pending_docwpd if blocked else 0
 
     # -- e. extract (docx) ---------------------------------------------------
-    before_ext = snapshot()
+    extracted_before = extracted_rows()
     rc, dt = run_stage("extract", "python/fulltext_extract_raw.py", [])
     record("extract", rc, dt)
 
@@ -260,22 +292,26 @@ def main() -> int:
     rc, dt = run_stage("extract-pdf", "python/fulltext_extract_pdf.py", [])
     record("extract-pdf", rc, dt)
     after_ext = snapshot()
-    metrics["extracted"] = max(0, n_status(after_ext, "extracted") - n_status(before_ext, "extracted"))
+    extracted_after = extracted_rows()
+    run_rows = newly_extracted(extracted_before, extracted_after)
+    run_symbols = sorted({symbol for symbol, _fmt in run_rows})
+    word_syms = sorted(symbol for symbol, fmt in run_rows if fmt in WORD_FORMATS)
+    pdf_syms = sorted(symbol for symbol, fmt in run_rows if fmt == "pdf")
+    manifest = ARCHIVE_ROOT / "run_manifests" / "nightly-symbols.txt"
+    write_symbols_manifest(manifest, run_symbols)
+    metrics["extracted"] = len(run_symbols)
 
     # -- g. parse ------------------------------------------------------------
-    extracted_now = n_status(after_ext, "extracted")
-    word_syms, pdf_syms = extracted_symbols()
     parsed_before = n_status(after_ext, "parsed")
-    if extracted_now == 0:
+    if not run_symbols:
         print("\n=== stage: parse ===\nno newly-extracted docs — skipping parse and gates.")
         results.append(("parse", "skipped", 0.0))
         metrics["parsed"] = 0
         gate_ran = False
         gate_failed = False
     else:
-        parse_limit = extracted_now + PARSE_MARGIN
         rc, dt = run_stage("parse", "python/fulltext_parse.py",
-                           ["--to-db", "--limit", str(parse_limit)])
+                           ["--to-db", "--symbols-file", str(manifest)])
         record("parse", rc, dt)
         after_parse = snapshot()
         metrics["parsed"] = max(0, n_status(after_parse, "parsed") - parsed_before)
@@ -333,6 +369,21 @@ def main() -> int:
     print(f"  absences recorded      : {metrics['absences_recorded']}")
 
     ok = not blocked and not gate_failed and not stage_failed
+    result_path = ARCHIVE_ROOT / "run_manifests" / "nightly-result.json"
+    result_tmp = result_path.with_suffix(".json.tmp")
+    result_tmp.write_text(json.dumps({
+        "run_id": os.getenv("GITHUB_RUN_ID"),
+        "ok": ok,
+        "blocked": blocked,
+        "gate_failed": gate_failed,
+        "stage_failed": stage_failed,
+        "targets": run_symbols,
+        "metrics": metrics,
+        "stages": [{"stage": label, "result": result, "seconds": round(dt, 3)}
+                   for label, result, dt in results],
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    result_tmp.replace(result_path)
+    print(f"  result                  : {result_path}")
     if blocked:
         print("\nFINAL: CONVERSION-BLOCKED — legacy doc/wpd need LibreOffice. Run "
               "`uv run python python/fulltext_pipeline.py` locally (with soffice) to "

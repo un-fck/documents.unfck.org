@@ -23,9 +23,9 @@ Three format families are handled (see fulltext_census.py / the corpus census):
                      consecutive paragraph rows (we merge them).
 
 This is deliberately standalone (mirrors the other python/ scripts): DATABASE_URL
-from .env, short-lived psycopg (v3) connections. Targets are documents whose
-document_files.status is 'extracted' or 'parsed' (so a re-parse still finds docs
-already loaded to the semantic DB).
+from .env, short-lived psycopg (v3) connections. The safe default targets only
+documents whose document_files.status is 'extracted'. Re-parsing an existing
+'parsed' document requires both --reparse and an explicit --symbol/--symbols-file.
 
 DB MODE (--to-db). The frozen semantic layer lands in two tables added by
 migration 003:
@@ -38,17 +38,18 @@ migration 003:
     the accounting invariant stays queryable in SQL.
 Loading is DELETE-then-INSERT per (symbol,lang) in BOTH tables (idempotent /
 re-parsable), batched over short-lived connections of ~20 docs each, mirroring
-fulltext_extract_raw.py's discipline. On success the document_files status is
-advanced 'extracted' -> 'parsed'; on a hard parse/insert failure it is set to
-'parse_failed' with the error recorded (never crashes the batch). An accounting
-failure does NOT fail the load — the doc is still written and the failure is
-recorded in document_parses.issues (and document_paragraphs stays queryable).
+fulltext_extract_raw.py's discipline. Validation happens before loading. Only a
+parse that passes accounting, source-conservation and overreach checks replaces
+semantic rows and advances status to 'parsed'. A failed new extraction becomes
+'parse_failed'; a failed explicit reparse preserves the last good rows and status.
 JSON output is written alongside the DB rows unless --db-only is given.
 
 Usage:
-    uv run python python/fulltext_parse.py                 # JSON only (all extracted/parsed docs)
+    uv run python python/fulltext_parse.py                 # JSON only (extracted docs)
     uv run python python/fulltext_parse.py --limit 5
     uv run python python/fulltext_parse.py --symbol A/RES/48/70
+    uv run python python/fulltext_parse.py --symbols-file tonight.txt --to-db
+    uv run python python/fulltext_parse.py --symbol A/RES/48/70 --reparse --to-db
     uv run python python/fulltext_parse.py --to-db         # JSON + semantic DB
     uv run python python/fulltext_parse.py --db-only        # semantic DB only, no JSON
 """
@@ -56,9 +57,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import fulltext_verbs as fv
@@ -1987,25 +1990,115 @@ def _heading_level(lr: LRow) -> int:
 # ---------------------------------------------------------------------------
 
 
-def fetch_targets(limit: int | None, symbol: str | None,
-                  offset: int = 0) -> list[tuple[str, str, str, str | None, str | None]]:
-    """Return (symbol_normalized, lang, format, archive_path, converted_path).
+@dataclass(frozen=True)
+class ParseTarget:
+    symbol: str
+    lang: str
+    fmt: str
+    archive_path: str | None
+    converted_path: str | None
+    source_symbol: str | None
+    source_sha256: str | None
+    status: str
 
-    Targets any doc whose raw extraction is available: status IN
-    ('extracted', 'parsed'). Including 'parsed' keeps re-parses working after the
-    loader has advanced status (a plain JSON re-run, or a re-load with --to-db,
-    still finds every already-loaded doc).
+
+def normalize_symbol(symbol: str) -> str:
+    return re.sub(r"\s+", "", symbol).upper()
+
+
+def read_symbols_file(path: Path) -> list[str]:
+    """Read a run manifest. An empty file deliberately means zero targets."""
+    if not path.is_file():
+        raise ValueError(f"symbols manifest does not exist: {path}")
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        value = raw.split("#", 1)[0].strip()
+        if not value:
+            continue
+        symbol = normalize_symbol(value)
+        if symbol not in seen:
+            symbols.append(symbol)
+            seen.add(symbol)
+    return symbols
+
+
+def _source_path(target: ParseTarget) -> Path | None:
+    rel = target.archive_path if target.fmt == "pdf" else (
+        target.converted_path or target.archive_path)
+    return ARCHIVE_ROOT / rel if rel else None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def preflight_targets(targets: list[ParseTarget]) -> list[str]:
+    """Return source problems before the parser is allowed to mutate the DB."""
+    problems: list[str] = []
+    hash_cache: dict[Path, str] = {}
+    for target in targets:
+        source_path = _source_path(target)
+        label = (f"{target.symbol} (via {target.source_symbol})"
+                 if target.source_symbol else target.symbol)
+        if source_path is None:
+            problems.append(f"{label}: no source path in document_files")
+            continue
+        if not source_path.is_file():
+            problems.append(f"{label}: source file missing: {source_path}")
+            continue
+        # sha256 describes the archived original, not a LibreOffice conversion.
+        # Check that original independently even when parsing its converted DOCX.
+        if target.source_sha256 and target.archive_path:
+            original_path = ARCHIVE_ROOT / target.archive_path
+            if not original_path.is_file():
+                problems.append(f"{label}: archived original missing: {original_path}")
+                continue
+            actual = hash_cache.get(original_path)
+            if actual is None:
+                actual = _sha256_file(original_path)
+                hash_cache[original_path] = actual
+            if actual != target.source_sha256:
+                problems.append(
+                    f"{label}: source sha256 mismatch: expected {target.source_sha256}, "
+                    f"got {actual}")
+    return problems
+
+
+def fetch_targets(limit: int | None, symbol: str | None,
+                  offset: int = 0, *, symbols: list[str] | None = None,
+                  reparse: bool = False) -> list[ParseTarget]:
+    """Return safe parse targets, resolving split children to their parent source.
+
+    The default queue is status='extracted'. status='parsed' is admitted only by
+    explicit, symbol-scoped --reparse mode. If ``symbols`` is an empty manifest,
+    return nothing rather than falling back to the whole queue.
     """
+    if symbols == []:
+        return []
+    requested = symbols if symbols is not None else (
+        [normalize_symbol(symbol)] if symbol else None)
+    statuses = ["extracted", "parsed"] if reparse else ["extracted"]
     sql = (
-        "SELECT df.symbol_normalized, df.lang, df.format, df.archive_path, df.converted_path "
+        "SELECT df.symbol_normalized, df.lang, df.format, "
+        "CASE WHEN df.source_symbol IS NULL THEN df.archive_path ELSE parent.archive_path END, "
+        "CASE WHEN df.source_symbol IS NULL THEN df.converted_path ELSE parent.converted_path END, "
+        "df.source_symbol, "
+        "CASE WHEN df.source_symbol IS NULL THEN df.sha256 ELSE parent.sha256 END, df.status "
         "FROM digitallibrary.document_files df "
-        "WHERE df.status IN ('extracted', 'parsed') "
+        "LEFT JOIN digitallibrary.document_files parent "
+        "  ON parent.symbol_normalized = df.source_symbol AND parent.lang = df.lang "
+        "WHERE df.lang = 'en' AND df.status = ANY(%s) "
     )
-    params: list[object] = []
-    if symbol:
-        sql += "AND df.symbol_normalized = %s "
-        params.append(symbol)
-    sql += "ORDER BY (df.status = 'extracted') DESC, df.symbol_normalized "
+    params: list[object] = [statuses]
+    if requested is not None:
+        sql += "AND df.symbol_normalized = ANY(%s) "
+        params.append(requested)
+    sql += "ORDER BY df.symbol_normalized "
     if limit:
         sql += "LIMIT %s "
         params.append(limit)
@@ -2014,7 +2107,17 @@ def fetch_targets(limit: int | None, symbol: str | None,
         params.append(offset)
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
-        return [(r[0], r[1] or "en", r[2], r[3], r[4]) for r in cur.fetchall()]
+        targets = [ParseTarget(r[0], r[1] or "en", r[2], r[3], r[4], r[5],
+                               r[6], r[7]) for r in cur.fetchall()]
+    if requested is not None and limit is None and offset == 0:
+        found = {target.symbol for target in targets}
+        missing = [value for value in requested if value not in found]
+        if missing:
+            mode = "extracted or parsed" if reparse else "extracted"
+            raise ValueError(
+                f"manifest contains {len(missing)} symbol(s) not eligible as {mode}: "
+                + ", ".join(missing[:20]))
+    return targets
 
 
 def fetch_rows(conn, symbol: str, lang: str = "en") -> list[dict]:
@@ -2762,6 +2865,31 @@ def _self_test() -> int:
     check(span is not None and 290 < span < 320,
           f"span anchoring wrong: expected ~305 words for the target only, got {span}")
 
+    # --- SAFETY controls: manifests and source preflight --------------------
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write(" A / RES / 1 \n# comment\nA/RES/1\nS/RES/2\n")
+        manifest_path = Path(fh.name)
+    check(read_symbols_file(manifest_path) == ["A/RES/1", "S/RES/2"],
+          "symbol manifest did not normalize/deduplicate exact targets")
+    manifest_path.write_text("# intentionally empty\n", encoding="utf-8")
+    check(read_symbols_file(manifest_path) == [],
+          "empty symbol manifest did not resolve to zero targets")
+    manifest_path.unlink()
+
+    with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as fh:
+        fh.write(b"source bytes")
+        preflight_path = Path(fh.name)
+    preflight_sha = hashlib.sha256(b"source bytes").hexdigest()
+    good_target = ParseTarget("A/RES/1", "en", "pdf", str(preflight_path), None,
+                              None, preflight_sha, "extracted")
+    check(preflight_targets([good_target]) == [],
+          "source preflight rejected an existing file with the correct hash")
+    bad_target = ParseTarget("A/RES/1", "en", "pdf", str(preflight_path), None,
+                             None, "0" * 64, "extracted")
+    check(bool(preflight_targets([bad_target])),
+          "source preflight did not reject a sha256 mismatch")
+    preflight_path.unlink()
+
     for f in failures:
         print(f"  FAIL {f}")
     print(f"\n{'FAIL' if failures else 'PASS'} — self-test: "
@@ -2776,7 +2904,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Semantic full-text parser (v1)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--offset", type=int, default=0)
-    ap.add_argument("--symbol")
+    target = ap.add_mutually_exclusive_group()
+    target.add_argument("--symbol")
+    target.add_argument("--symbols-file", type=Path,
+                        help="exact symbol manifest, one per line; an empty file means no work")
+    ap.add_argument("--reparse", action="store_true",
+                    help="also admit status='parsed'; requires --symbol or --symbols-file")
     ap.add_argument("--out", default=str(OUT_DIR))
     ap.add_argument("--to-db", action="store_true",
                     help="load the semantic DB tables (migration 003) alongside JSON")
@@ -2789,14 +2922,34 @@ def main() -> int:
     if args.self_test:
         return _self_test()
 
+    if args.reparse and not (args.symbol or args.symbols_file):
+        ap.error("--reparse requires an explicit --symbol or --symbols-file")
+
     to_db = args.to_db or args.db_only
     write_json = not args.db_only
+
+    try:
+        manifest_symbols = (read_symbols_file(args.symbols_file)
+                            if args.symbols_file else None)
+        targets = fetch_targets(args.limit, args.symbol, args.offset,
+                                symbols=manifest_symbols, reparse=args.reparse)
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    source_problems = preflight_targets(targets)
+    if source_problems:
+        print(f"PRECHECK FAILED — {len(source_problems)} target source problem(s); "
+              "the database was not changed.")
+        for problem in source_problems[:50]:
+            print(f"  ! {problem}")
+        if len(source_problems) > 50:
+            print(f"  ... +{len(source_problems) - 50} more")
+        return 1
 
     out_dir = Path(args.out)
     if write_json:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    targets = fetch_targets(args.limit, args.symbol, args.offset)
     dest = []
     if write_json:
         dest.append(str(out_dir))
@@ -2812,6 +2965,7 @@ def main() -> int:
     n_truncated = 0
     n_unreadable = 0
     n_unchecked = 0
+    n_source_ok = 0
     n_overreach = 0
     n_markers_refused = 0
     total_elems = 0
@@ -2819,7 +2973,12 @@ def main() -> int:
     for start in range(0, len(targets), BATCH_DOCS):
         chunk = targets[start:start + BATCH_DOCS]
         with get_conn() as conn:
-            for symbol, lang, fmt, archive_path, converted_path in chunk:
+            for target_row in chunk:
+                symbol = target_row.symbol
+                lang = target_row.lang
+                fmt = target_row.fmt
+                archive_path = target_row.archive_path
+                converted_path = target_row.converted_path
                 try:
                     raw_rows = fetch_rows(conn, symbol, lang)
                     result = parse_document(symbol, fmt, raw_rows)
@@ -2869,40 +3028,63 @@ def main() -> int:
                         print(f"  ! {symbol}: SOURCE UNREADABLE {cons['reason']}")
                     elif cons["status"] == "unchecked":
                         n_unchecked += 1
+                    elif cons["status"] == "ok":
+                        n_source_ok += 1
+                    validation_failed = bool(
+                        err or lost or foreign
+                        or cons["status"] in ("truncated", "unreadable"))
                     if write_json:
-                        out_path = out_dir / f"{sanitize_symbol(symbol)}.json"
+                        # A rejected reparse must not replace the last good JSON,
+                        # just as it must not replace the semantic DB rows.
+                        json_dir = out_dir / "_failed" if validation_failed else out_dir
+                        json_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = json_dir / f"{sanitize_symbol(symbol)}.json"
                         out_path.write_text(
                             json.dumps(result, ensure_ascii=False, indent=1),
                             encoding="utf-8")
-                    if to_db:
+                    if to_db and not validation_failed:
                         total_elems += load_document(conn, symbol, lang, fmt, result)
-                        # A truncated / unverifiable-source parse is NEVER advanced to
-                        # 'parsed': the rows are still written (nothing is deleted) but
-                        # the ledger says the document is not fit, so the class cannot
-                        # disappear again behind a green status.
-                        if cons["status"] in ("truncated", "unreadable") or foreign:
-                            reason = (f"source_{cons['status']}: {cons['reason']}"
-                                      if cons["status"] in ("truncated", "unreadable")
-                                      else f"source_overreach: carries headings of "
-                                           f"{', '.join(foreign)}")
-                            upsert_document_file(
-                                conn, symbol, lang, status="parse_failed",
-                                error=reason[:500])
-                        else:
-                            upsert_document_file(conn, symbol, lang, status="parsed", error=None)
+                        upsert_document_file(conn, symbol, lang, status="parsed", error=None)
                         conn.commit()
                         n_loaded += 1
-                    n_ok += 1
+                    elif to_db and validation_failed:
+                        # New documents have no prior good semantic version to keep.
+                        # A failed explicit reparse does: leave its rows and parsed
+                        # status untouched so a rejected v5 attempt cannot replace v4.
+                        if target_row.status == "extracted":
+                            reasons = []
+                            if err:
+                                reasons.append(f"accounting: {err}")
+                            if lost:
+                                reasons.append("word_accounting: " + ", ".join(lost[:8]))
+                            if cons["status"] in ("truncated", "unreadable"):
+                                reasons.append(f"source_{cons['status']}: {cons['reason']}")
+                            if foreign:
+                                reasons.append("source_overreach: " + ", ".join(foreign))
+                            upsert_document_file(
+                                conn, symbol, lang, status="parse_failed",
+                                error="; ".join(reasons)[:500])
+                            conn.commit()
+                        else:
+                            conn.rollback()
+                            print(f"  ! {symbol}: rejected reparse; preserved existing "
+                                  "semantic rows and parsed status")
+                    if not validation_failed:
+                        n_ok += 1
                 except Exception as exc:  # never crash the batch on one doc
                     if to_db:
                         conn.rollback()
-                        try:
-                            upsert_document_file(
-                                conn, symbol, lang, status="parse_failed",
-                                error=f"{type(exc).__name__}: {exc}"[:500])
-                            conn.commit()
-                        except Exception:
-                            conn.rollback()
+                        if target_row.status == "extracted":
+                            try:
+                                upsert_document_file(
+                                    conn, symbol, lang, status="parse_failed",
+                                    error=f"{type(exc).__name__}: {exc}"[:500])
+                                conn.commit()
+                            except Exception:
+                                conn.rollback()
+                        else:
+                            print(f"  ! {symbol}: failed reparse preserved existing "
+                                  "semantic rows and parsed status")
                     n_failed += 1
                     print(f"  ! {symbol}: {type(exc).__name__}: {exc}")
         done = start + len(chunk)
@@ -2914,8 +3096,7 @@ def main() -> int:
     print(f"Markers refused as unconfirmed: {n_markers_refused}")
     print(f"Documents carrying another document's headings (crop over-reach): {n_overreach}")
     print(f"Source conservation: {n_truncated} TRUNCATED, {n_unreadable} unreadable, "
-          f"{n_unchecked} unchecked, "
-          f"{n_ok - n_truncated - n_unreadable - n_unchecked} ok")
+          f"{n_unchecked} unchecked, {n_source_ok} ok")
     if truncated_syms:
         print("  truncated: " + ", ".join(truncated_syms[:20])
               + (" …" if len(truncated_syms) > 20 else ""))

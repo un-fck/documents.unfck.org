@@ -78,7 +78,6 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       ADV_DATABASE_URL: postgresql://adv:adv@127.0.0.1:55432/advtest
       FULLTEXT_ARCHIVE_ROOT: ${{ secrets.FULLTEXT_ARCHIVE_ROOT }}
-      ADV_SCRATCH: ${{ runner.temp }}/fulltext_adv
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
@@ -90,12 +89,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
 
       - name: Seed the throwaway cluster from production (read-only)
+        env:
+          ADV_SCRATCH: ${{ runner.temp }}/fulltext_adv
         run: uv run python python/fulltext_negative_controls.py --seed
 
       # --require is the guard on the guard: if the archive is not mounted, or a
       # group crashes, the suite has silently checked nothing. Exiting 0 on that
       # is the failure mode this whole workflow exists to prevent.
       - name: Negative controls
+        env:
+          ADV_SCRATCH: ${{ runner.temp }}/fulltext_adv
         run: |
           uv run python python/fulltext_negative_controls.py --require 40 \
             > "$RUNNER_TEMP/negative-controls.log" 2>&1

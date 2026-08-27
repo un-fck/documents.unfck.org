@@ -416,10 +416,10 @@ _CHILD_INSERT = (
 )
 
 
-def write_children(conn, volume: str, lang: str, fmt: str, res: SplitResult) -> int:
+def write_children(conn, volume: str, lang: str, fmt: str, res: SplitResult) -> list[str]:
     """Delete this volume's existing children, insert the fresh child rows, and
     upsert child ledger rows (status='extracted', source_symbol=<volume>). Returns
-    the number of child documents written."""
+    the exact child symbols written."""
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM digitallibrary.document_paragraphs_raw WHERE source_symbol = %s",
@@ -473,15 +473,25 @@ def write_children(conn, volume: str, lang: str, fmt: str, res: SplitResult) -> 
         upsert_document_file(conn, child, lang, status="extracted",
                              source_symbol=volume, format=fmt, error=None)
     res.shared_skipped = shared_skipped
-    return len(written)
+    return written
 
 
 # ---------------------------------------------------------------------------
 # Split runner (sha256-gate)
 # ---------------------------------------------------------------------------
 
+def write_symbols_manifest(path: Path, symbols: set[str]) -> None:
+    """Write an exact stage result. Empty means no downstream work."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("".join(f"{symbol}\n" for symbol in sorted(symbols)),
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
 def run_split(symbols: list[str] | None, force: bool, dry_run: bool,
-              limit: int | None) -> int:
+              limit: int | None, changed_symbols_out: Path | None = None,
+              changed_volumes_out: Path | None = None) -> int:
     with get_conn() as conn:
         vols = volume_ledger(conn, symbols, include_split=force)
         state = read_state(conn, STATE_KEY)
@@ -493,6 +503,8 @@ def run_split(symbols: list[str] | None, force: bool, dry_run: bool,
     print(f"Volume-split: {len(vols)} extracted volume(s) to consider")
 
     total_children = total_cross = total_unmatched = processed = skipped_gate = 0
+    changed_children: set[str] = set()
+    changed_volumes: set[str] = set()
     for symbol, lang, fmt, sha, _status in vols:
         kind = catalog_kind.get(symbol)
         if kind is None:
@@ -504,19 +516,24 @@ def run_split(symbols: list[str] | None, force: bool, dry_run: bool,
         with get_conn() as conn:
             rows = read_volume_rows(conn, symbol, lang)
             res = split_volume(conn, symbol, lang, kind, rows)
-            n_write = len(res.children)
-            print(f"  {symbol} [{kind}] rows={len(rows)} -> children={n_write} "
+            planned = len(res.children)
+            print(f"  {symbol} [{kind}] rows={len(rows)} -> children={planned} "
                   f"crosscheck={len(res.crosscheck)} unmatched={len(res.unmatched)} "
                   f"skipped_existing={len(res.skipped_existing)}")
             if res.unmatched[:5]:
                 for u in res.unmatched[:5]:
                     print(f"      unmatched heading: {u!r}")
             if not dry_run:
-                write_children(conn, symbol, lang, VOLUME_FORMAT.get(kind, fmt), res)
+                written = write_children(conn, symbol, lang, VOLUME_FORMAT.get(kind, fmt), res)
                 # Retire the volume from the parse/gate lifecycle.
                 upsert_document_file(conn, symbol, lang, status="split")
                 conn.commit()
                 done_sha[symbol] = sha
+                changed_children.update(written)
+                changed_volumes.add(symbol)
+                n_write = len(written)
+            else:
+                n_write = planned
         total_children += n_write
         total_cross += len(res.crosscheck)
         total_unmatched += len(res.unmatched)
@@ -525,6 +542,11 @@ def run_split(symbols: list[str] | None, force: bool, dry_run: bool,
     if not dry_run and processed:
         with get_conn() as conn:
             write_state(conn, STATE_KEY, {"volumes": done_sha})
+
+    if changed_symbols_out is not None:
+        write_symbols_manifest(changed_symbols_out, changed_children)
+    if changed_volumes_out is not None:
+        write_symbols_manifest(changed_volumes_out, changed_volumes)
 
     print(f"\nDone. volumes processed={processed} sha256-skipped={skipped_gate} "
           f"| children written={total_children} crosscheck={total_cross} "
@@ -707,13 +729,52 @@ def run_nightly() -> int:
     ga_ecosoc = [s for s, k in volume_catalog() if k in ("ga", "ecosoc")]
     csv = ",".join(ga_ecosoc)
     py = ["uv", "run", "python"]
+    manifest_dir = ARCHIVE_ROOT / "run_manifests"
+    child_manifest = manifest_dir / "volume-children.txt"
+    volume_manifest = manifest_dir / "changed-volumes.txt"
+    write_symbols_manifest(child_manifest, set())
+    write_symbols_manifest(volume_manifest, set())
+    with get_conn() as conn:
+        ready_before = {row[0] for row in volume_ledger(conn, ga_ecosoc)}
     rc = 0
     rc |= stage("fetch", py + ["python/fulltext_split_volumes.py", "--fetch", "--symbols", csv])
     rc |= stage("extract-pdf", py + ["python/fulltext_extract_pdf.py", "--symbols", csv])
-    rc |= stage("split", py + ["python/fulltext_split_volumes.py", "--split"])
-    # children are now status='extracted'; parse them (extracted-first ordering).
-    rc |= stage("parse", py + ["python/fulltext_parse.py", "--to-db"])
-    rc |= stage("verify", py + ["python/fulltext_verify_volumes.py"])
+    with get_conn() as conn:
+        ready_after = {row[0] for row in volume_ledger(conn, ga_ecosoc)}
+    newly_ready = sorted(ready_after - ready_before)
+    if newly_ready:
+        split_rc = stage("split", py + [
+            "python/fulltext_split_volumes.py", "--split",
+            "--symbols", ",".join(newly_ready),
+            "--changed-symbols-out", str(child_manifest),
+            "--changed-volumes-out", str(volume_manifest),
+        ])
+    else:
+        print("\nvolume split skipped: no parent volume became ready in this run")
+        split_rc = 0
+    rc |= split_rc
+
+    children = [line.strip() for line in child_manifest.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+    volumes = [line.strip() for line in volume_manifest.read_text(encoding="utf-8").splitlines()
+               if line.strip()]
+    if split_rc != 0:
+        print("\nvolume parse/verify skipped because split failed")
+    elif not children and not volumes:
+        print("\nvolume parse/verify skipped: no volume changed")
+    else:
+        if children:
+            rc |= stage("parse", py + [
+                "python/fulltext_parse.py", "--to-db", "--symbols-file",
+                str(child_manifest),
+            ])
+        else:
+            print("\nvolume parse skipped: changed volumes produced no children")
+        if volumes:
+            rc |= stage("verify", py + [
+                "python/fulltext_verify_volumes.py", "--symbols", ",".join(volumes),
+                "--children",
+            ])
     print("\nvolume nightly rc =", rc)
     return 0 if rc == 0 else 1
 
@@ -767,6 +828,16 @@ def _self_test() -> int:
     check("A/HRC/2/9" in [normalize_symbol(s) for s in hrc_report_symbols()], "HRC report missing")
     check("A/HRC/S-11/2" in [normalize_symbol(s) for s in hrc_report_symbols()], "HRC special missing")
 
+    # Exact stage manifests: sorted/deduplicated, and empty never means all.
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = Path(tmp) / "changed.txt"
+        write_symbols_manifest(manifest, {"S/RES/2", "A/RES/1"})
+        check(manifest.read_text(encoding="utf-8") == "A/RES/1\nS/RES/2\n",
+              "changed-symbol manifest is not exact/deterministic")
+        write_symbols_manifest(manifest, set())
+        check(manifest.read_text(encoding="utf-8") == "",
+              "empty changed-symbol manifest did not mean zero work")
+
     for m in fails:
         print("  FAIL:", m)
     if fails:
@@ -799,6 +870,10 @@ def main() -> int:
                          "t=pdf) — use while an ODS backfill is running to avoid contention")
     ap.add_argument("--skip-hrc", action="store_true",
                     help="fetch GA/ECOSOC volumes only, skip the HRC Word reports")
+    ap.add_argument("--changed-symbols-out", type=Path,
+                    help="write exact child symbols changed by --split (empty means none)")
+    ap.add_argument("--changed-volumes-out", type=Path,
+                    help="write exact parent volumes changed by --split (empty means none)")
     args = ap.parse_args()
 
     symbols = [normalize_symbol(s) for s in args.symbols.split(",")] if args.symbols else None
@@ -813,7 +888,8 @@ def main() -> int:
     if args.nightly:
         return run_nightly()
     # default: split
-    return run_split(symbols, args.force, args.dry_run, args.limit)
+    return run_split(symbols, args.force, args.dry_run, args.limit,
+                     args.changed_symbols_out, args.changed_volumes_out)
 
 
 if __name__ == "__main__":
