@@ -23,9 +23,18 @@ Pipeline per document (all deterministic):
      is recorded status='no_text_layer' and skipped. The triage score rides along
      on every emitted row's props (textlayer_score) and in the ledger error field.
   2. EXTRACT spans -> lines (pymupdf), DROP running headers/footers/page numbers
-     (position + repetition + pattern), reconstruct PARAGRAPHS by column left-edge
-     indent + vertical gaps + terminal punctuation, repairing end-of-line
-     hyphenation conservatively.
+     (position + repetition + pattern), analyse the page LAYOUT with a recursive
+     X-Y cut (columns separated by a whitespace gutter, bands separated by
+     full-width lines) so every page is read in printed reading order, then
+     reconstruct PARAGRAPHS inside each region by left-edge indent + vertical
+     gaps + terminal punctuation, resolving end-of-line hyphenation from corpus
+     and same-document evidence.
+
+     Text is NEVER merged across a column boundary: doing so is what produced
+     sentences that exist in no document ("Convinced that all peoples have an
+     inalienable right any distinction as to race, creed or colour, in order to
+     to complete freedom ...", A/RES/1514(XV)). Where the geometry is genuinely
+     ambiguous the extractor fragments and flags rather than inventing an order.
   3. CROP to the target resolution inside the excerpt (its own number heading ..
      its adoption record / the next resolution's heading). Never silently
      truncate: if the crop anchor is uncertain, keep everything and flag it.
@@ -55,9 +64,14 @@ from pathlib import Path
 import fitz  # pymupdf
 from psycopg.types.json import Jsonb
 
-from fulltext_common import ARCHIVE_ROOT, get_conn, upsert_document_file
+from fulltext_common import (ARCHIVE_ROOT, get_conn, sanitize_symbol,
+                             upsert_document_file)
 
-EXTRACTOR_VERSION = "pdf-v1"
+# pdf-v2 (2026-07-28): layout-aware reading order (recursive X-Y cut), evidence-
+# based end-of-line hyphenation, region-level facing-language detection. Rows
+# written by pdf-v1 are NOT comparable: v1 read two-column pages by visual row
+# and wove the columns together.
+EXTRACTOR_VERSION = "pdf-v2"
 BATCH_DOCS = 20
 
 # pymupdf span flag bits.
@@ -90,15 +104,24 @@ def _tokens(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Facing-language (French) line detection — for the old bilingual GA/ECOSOC
-# supplement volumes, where an English column faces a French one on the same
-# page. We drop French-only lines from BOTH the body and the verify ground truth
-# so the interleaved French column does not truncate the English crop or flood the
-# gate with expected-loss French words. Deliberately a tiny, high-precision set of
-# French FUNCTION words that essentially never occur in English UN prose; a line is
-# 'French' only when it carries >=3 of them (so an English line quoting one French
-# name is never dropped).
+# Facing-language detection — REGION level, never line level
 # ---------------------------------------------------------------------------
+# The old GA/ECOSOC supplement volumes print an English column facing a French
+# one on the same page, and the trilingual Official Records sheets add Spanish.
+# That foreign text must not enter an English record.
+#
+# It used to be decided one LINE at a time: >=3 French function words meant the
+# line was French. Applied unconditionally, that deleted 1,003 English lines
+# from 39 monolingual documents — every one an official NGO name in French
+# ('Association pour le Déploiement Rural, la Protection de …'), with its
+# English continuation left orphaned. The predicate was right about French; it
+# was wrong about what a line is evidence FOR.
+#
+# A facing language occupies a whole COLUMN. So the unit of decision is the
+# layout region, and a region is only dropped when the document also holds
+# English regions — a document with no English at all is kept whole and flagged,
+# because deleting a document is not a language decision.
+
 FRENCH_STOPWORDS = frozenset("""
 le la les des du et aux une dans par qui que pour avec sur ses leur leurs cette
 ces entre ainsi dont sont elle ils nous vous tous comme sans sous deux cet celle
@@ -106,18 +129,224 @@ ceux votre notre seance pleniere economique institutions specialisees
 renseignements secretaire egalement competentes territoires autonomes assemblee
 generale conseil comite novembre decembre janvier fevrier avril juin juillet
 septembre octobre adoptee mondiale examine informer presenter maintenir
+etant apres avoir etre fait ete cas afin lors ainsi meme tout toute
+""".split())
+
+SPANISH_STOPWORDS = frozenset("""
+el los las del y en que por para con su sus como este esta estos entre sobre sin
+al se es ha han sido sera cuando donde asamblea consejo economico general
+resolucion informe secretario naciones unidas seguridad periodo sesiones
+aprobada plenaria septiembre octubre noviembre diciembre enero febrero
+""".split())
+
+ENGLISH_STOPWORDS = frozenset("""
+the of to and in that is was for it with as on be at by this which shall its
+all from or has have their been are not but were they we he she there would
+should may must any such other more than then when where who whom while
+general assembly security council economic social nations united resolution
 """.split())
 
 _FR_TOKEN = re.compile(r"[a-zà-ÿ']+")
 
+# A region is foreign when the foreign function words clearly beat the English
+# ones. Thresholds are deliberately coarse: a mixed region stays English, since
+# keeping foreign text is a blemish while deleting English text is a loss.
+# Calibrated on a census of 935 regions from 200 random PDFs plus the four
+# volumes whose English NGO-name lists the old per-line filter deleted:
+#   genuine French regions  fr rate 0.175-0.336, fr/en ratio 6.1 - inf
+#   English NGO-name lists  fr rate 0.076-0.186, fr/en ratio 2.1 - 2.6
+# The RATE alone does not separate them; the RATIO does, with a 2.4x margin.
+_LANG_MIN_TOKENS = 25
+_LANG_MIN_LINES = 3
+_LANG_MIN_HITS = 8
+_LANG_MIN_RATE = 0.12
+_LANG_DOMINANCE = 4.0
+
 
 def french_line(text: str) -> bool:
-    """True for a line that is clearly French facing-language content."""
+    """True for a line that is clearly French facing-language content.
+
+    Kept for callers that score a single line (e.g. the PDF verify gate's ground
+    truth). It is NOT used to delete body text any more — see
+    `classify_region_language`."""
     toks = _FR_TOKEN.findall(text.lower())
     if len(toks) < 4:
         return False
     hits = sum(1 for t in toks if t in FRENCH_STOPWORDS)
     return hits >= 3
+
+
+def classify_region_language(lines: list[Line]) -> tuple[str, dict[str, int]]:
+    """Return ('en'|'fr'|'es'|'unknown', hit counts) for a layout region."""
+    toks: list[str] = []
+    for l in lines:
+        toks.extend(_FR_TOKEN.findall((l.text or "").lower()))
+    counts = {
+        "en": sum(1 for t in toks if t in ENGLISH_STOPWORDS),
+        "fr": sum(1 for t in toks if t in FRENCH_STOPWORDS),
+        "es": sum(1 for t in toks if t in SPANISH_STOPWORDS),
+        "tokens": len(toks),
+    }
+    if len(toks) < _LANG_MIN_TOKENS or len(lines) < _LANG_MIN_LINES:
+        return "unknown", counts
+    foreign = max(("fr", counts["fr"]), ("es", counts["es"]), key=lambda kv: kv[1])
+    if (foreign[1] >= _LANG_MIN_HITS
+            and foreign[1] >= _LANG_DOMINANCE * counts["en"]
+            and foreign[1] / len(toks) >= _LANG_MIN_RATE):
+        return foreign[0], counts
+    if counts["en"] >= 3:
+        return "en", counts
+    return "unknown", counts
+
+
+def drop_foreign_regions(groups: list[list[Line]], flags: set[str],
+                         has_english: bool | None = None,
+                         ) -> tuple[list[list[Line]], list[str]]:
+    """Remove whole facing-language regions. Returns (kept groups, dropped text)."""
+    if not groups:
+        return groups, []
+    langs = [classify_region_language(g)[0] for g in groups]
+    if has_english is None:
+        has_english = any(l == "en" for l in langs)
+    if not has_english:
+        if any(l in ("fr", "es") for l in langs):
+            flags.add("no_english_region_kept_whole")
+        return groups, []
+    kept: list[list[Line]] = []
+    dropped: list[str] = []
+    for g, lang in zip(groups, langs):
+        if lang in ("fr", "es"):
+            flags.add(f"dropped_{lang}_region")
+            dropped.extend((l.text or "") for l in g)
+            continue
+        kept.append(g)
+    return kept, dropped
+
+
+# ---------------------------------------------------------------------------
+# End-of-line hyphenation — decided on evidence, never on a rule of thumb
+# ---------------------------------------------------------------------------
+# A hyphen at a line end is ambiguous: 'self-' + 'determination' is a compound
+# whose hyphen must SURVIVE, 'avoid-' + 'ing' is a typesetter's break whose
+# hyphen must GO. Deleting it unconditionally (what this file used to do) put
+# 'selfdetermination' into 131 rows of 109 documents and destroyed 8.12% of all
+# hyphenated compounds — legal terms of art, silently rewritten.
+#
+# The evidence is how the SAME pages spell the compound when it happens to fall
+# inside a line, where no join can have occurred. Three tiers, most specific
+# first:
+#   1. THIS document's own within-line spellings (house style is consistent);
+#   2. a pair lexicon counted from within-line tokens of pre-1994 PDFs
+#      (`data/hyphen_pairs.txt`, era-matched: these volumes write 'co-operation'
+#      and 'peace-keeping' where a 2015 corpus writes neither);
+#   3. a small embedded core of prefixes that the UN always hyphenates.
+# With no evidence at all the hyphen is dropped, which is right for ~92% of
+# breaks — but the decision is counted, so the residual is reportable.
+
+HYPHEN_LEXICON_PATH = Path(__file__).resolve().parent / "data" / "hyphen_pairs.txt"
+
+# Prefixes the UN hyphenates as a matter of drafting style, used only when the
+# corpus has nothing to say about the pair. Kept deliberately short: every entry
+# is a claim, and a wrong entry damages text just as a missing one does.
+CORE_HYPHEN_PREFIXES = frozenset("""
+self non ex quasi pseudo socio vice anti neo
+""".split())
+
+_MIN_DOC_EVIDENCE = 1     # one within-line spelling in the same document decides
+_MIN_PAIR_EVIDENCE = 5    # …else at least this many corpus observations
+_TRAIL_WORD_RE = re.compile(r"([A-Za-z]+(?:-[A-Za-z]+)*)-$")
+_LEAD_WORD_RE = re.compile(r"^([A-Za-z]+)")
+_INLINE_HYPH_RE = re.compile(r"[A-Za-z]{2,}(?:-[A-Za-z]{2,})+")
+_INLINE_PLAIN_RE = re.compile(r"[A-Za-z]{4,}")
+
+
+def load_pair_lexicon(path: Path = HYPHEN_LEXICON_PATH) -> dict[tuple[str, str], tuple[int, int]]:
+    """Load '<left> <right> <hyphenated> <joined>' counts. Missing file is loud."""
+    out: dict[tuple[str, str], tuple[int, int]] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        import sys as _sys
+        print(f"WARNING: hyphen pair lexicon not found at {path}; falling back to "
+              f"prefix rules only (hyphenated compounds may be damaged)",
+              file=_sys.stderr)
+        return out
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        out[(parts[0], parts[1])] = (int(parts[2]), int(parts[3]))
+    return out
+
+
+class HyphenPolicy:
+    """Decides, per line-break hyphen, whether the hyphen is part of the word."""
+
+    def __init__(self, pairs: dict[tuple[str, str], tuple[int, int]] | None = None):
+        self.pairs = load_pair_lexicon() if pairs is None else pairs
+        self.doc_h: dict[tuple[str, str], int] = {}
+        self.doc_j: dict[str, int] = {}
+        self.decisions: dict[str, int] = {"doc": 0, "corpus": 0, "prefix": 0, "default": 0}
+        self.kept = 0
+        self.dropped = 0
+
+    def observe(self, lines: list[Line]) -> None:
+        """Record this document's WITHIN-LINE spellings (never a broken word)."""
+        for ln in lines:
+            t = (ln.text or "").strip()
+            if t.endswith("-"):
+                t = t[:t.rfind(" ")] if " " in t else ""
+            for m in _INLINE_HYPH_RE.finditer(t):
+                segs = m.group(0).lower().split("-")
+                for a, b in zip(segs, segs[1:]):
+                    self.doc_h[(a, b)] = self.doc_h.get((a, b), 0) + 1
+            for m in _INLINE_PLAIN_RE.finditer(t):
+                w = m.group(0).lower()
+                self.doc_j[w] = self.doc_j.get(w, 0) + 1
+
+    def keep_hyphen(self, left_text: str, right_text: str) -> bool:
+        m = _TRAIL_WORD_RE.search(left_text.rstrip())
+        n = _LEAD_WORD_RE.match(right_text.lstrip())
+        if not m or not n:
+            self.dropped += 1
+            self.decisions["default"] += 1
+            return False
+        left = m.group(1).lower().split("-")[-1]
+        right = n.group(1).lower()
+        keep, why = self._decide(left, right)
+        self.decisions[why] += 1
+        if keep:
+            self.kept += 1
+        else:
+            self.dropped += 1
+        return keep
+
+    def _decide(self, left: str, right: str) -> tuple[bool, str]:
+        if len(left) < 2 or len(right) < 2:
+            return False, "default"
+        h = self.doc_h.get((left, right), 0)
+        j = self.doc_j.get(left + right, 0)
+        if h + j >= _MIN_DOC_EVIDENCE:
+            return h > j, "doc"
+        h, j = self.pairs.get((left, right), (0, 0))
+        if h + j >= _MIN_PAIR_EVIDENCE:
+            return h > j, "corpus"
+        if left in CORE_HYPHEN_PREFIXES:
+            return True, "prefix"
+        return False, "default"
+
+
+_DEFAULT_HYPHEN: HyphenPolicy | None = None
+
+
+def _default_hyphen() -> HyphenPolicy:
+    """Lazy module-level policy for helpers called without a document."""
+    global _DEFAULT_HYPHEN
+    if _DEFAULT_HYPHEN is None:
+        _DEFAULT_HYPHEN = HyphenPolicy()
+    return _DEFAULT_HYPHEN
 
 
 @dataclass
@@ -209,6 +438,7 @@ class Line:
     page: int
     cleft: float = 0.0   # left edge of this line's column (set after column split)
     cright: float = 0.0  # right edge of this line's column
+    soft_divider: float = 0.0  # x of a column boundary that could not be cut cleanly
 
 
 def _span_style(span: dict) -> tuple[bool, bool]:
@@ -333,13 +563,78 @@ def drop_headers_footers(lines: list[Line], page_heights: dict[int, float]) -> t
 
 
 # ---------------------------------------------------------------------------
-# Column detection (old supplements are single-column; guard for 2-column)
+# LAYOUT ANALYSIS — recursive X-Y cut (columns and bands)
 # ---------------------------------------------------------------------------
+# The Official Records supplements print two (occasionally three) columns, often
+# under a full-width heading and above a full-width table, signature block or
+# annex. Reading such a page by visual ROW — which is what a y-then-x sort does —
+# interleaves the columns into sentences that exist in no document
+# ("Convinced that all peoples have an inalienable right any distinction as to
+# race, creed or colour, in order to to complete freedom, …", A/RES/1514(XV)).
+# That is fabrication, and it is the single worst thing this file can do.
+#
+# The replacement is a recursive X-Y cut:
+#
+#   1. Look for a VERTICAL GUTTER: an x-strip that no line's box enters, wide
+#      enough not to be a word space, with a genuine text column on each side
+#      (enough lines, and lines that FILL their column — which is what tells a
+#      newspaper column apart from a table's cells or a hanging-marker gutter).
+#   2. Lines that STRADDLE the gutter (a full-width heading, a rule, a wide
+#      table row) cut the region into horizontal BANDS instead; each band is
+#      re-analysed on its own, and the straddling line is read in its place.
+#   3. Recurse, so a 3-column page splits twice and a header-over-two-columns
+#      page splits by band and then by column.
+#
+# The result is a list of line groups in READING ORDER. Text is never merged
+# across a column boundary: `reconstruct_paragraphs` starts a new paragraph at
+# every group boundary unless the previous group ends mid-sentence in a line
+# that fills its column (the newspaper continuation rule).
+#
+# When the geometry is ambiguous — a gutter exists but the straddles are
+# scattered through the body, so neither reading is safe — the region is left
+# unsplit AND a flag is raised, because a flagged gap is a defect and a silent
+# weave is a falsehood.
+
+MIN_GUTTER_PT = 5.0        # narrower than this is a word space, not a gutter.
+                           # The 1940s supplements set columns 6pt apart, so this
+                           # cannot be raised; what keeps word gaps from passing
+                           # is that a real gutter is empty for the whole column
+                           # height (the straddle count) and has a text column on
+                           # each side.
+MAX_GUTTER_FRAC = 0.30     # wider than this (of the region) is not a gutter
+MIN_COL_LINES = 4          # a column with fewer lines is not a column
+MIN_COL_SHARE = 0.15       # …nor is one holding <15% of the region's lines
+MIN_COL_WIDTH_FRAC = 0.18  # …nor one narrower than 18% of the region
+MAX_CROSS_SHARE = 0.45     # more straddles than this: not a columnar region
+MIN_FILL_RATIO = 0.25      # share of a column's lines that must fill it
+MAX_CUT_DEPTH = 5          # guards runaway recursion (bands nest inside bands)
+MAX_Y_CUT_DEPTH = 1        # horizontal cuts are tried only near the top level
+
 
 def _row_sort(lines: list[Line]) -> list[Line]:
-    """Order lines top-to-bottom, but group spans of the same visual row (within a
-    ~4pt band) left-to-right — so a hanging marker '1.' precedes its text line."""
-    return sorted(lines, key=lambda l: (round(l.y0 / 4.0), l.x0))
+    """Order lines top-to-bottom, grouping each visual ROW left-to-right.
+
+    Two boxes are on the same row when they overlap vertically by more than half
+    a line height. A fixed 4pt band (what this used to do) misplaced a hanging
+    marker whose OCR box starts 3pt below its own text, producing
+    'the Elimi- (a) nation of Discrimination' — the marker welded into the
+    middle of the word it labels."""
+    order = sorted(lines, key=lambda l: (l.y0, l.x0))
+    rows: list[list[Line]] = []
+    for l in order:
+        if rows:
+            row = rows[-1]
+            bot = min(x.y1 for x in row)
+            top = max(x.y0 for x in row)
+            overlap = min(l.y1, bot) - max(l.y0, top)
+            if overlap > 0.5 * max(l.y1 - l.y0, 4.0):
+                row.append(l)
+                continue
+        rows.append([l])
+    out: list[Line] = []
+    for row in rows:
+        out.extend(sorted(row, key=lambda l: l.x0))
+    return out
 
 
 def _set_edges(group: list[Line]) -> None:
@@ -352,40 +647,289 @@ def _set_edges(group: list[Line]) -> None:
         l.cleft, l.cright = cleft, cright
 
 
-def split_columns(lines: list[Line], page_width: float) -> list[list[Line]]:
-    """Return reading-ordered line groups and stamp per-column edges.
+def _fills_column(group: list[Line], width: float) -> bool:
+    """True when the group holds a TEXT column: a real share of its lines span
+    most of the column width. A block of table cells, a column of page numbers
+    or the marker gutter of a hanging-indent list does not, which is how they
+    are refused. The MEDIAN is not used: a text column that also carries a table
+    (common on Official Records pages, where a budget annex sits beside prose)
+    has a short median and is still a column."""
+    if width <= 0 or len(group) < MIN_COL_LINES:
+        return False
+    wide = sum(1 for l in group if (l.x1 - l.x0) >= 0.60 * width)
+    return wide >= MIN_FILL_RATIO * len(group)
 
-    Two columns are detected by a GUTTER: a vertical strip in the central region
-    that almost no line box crosses. A horizontal coverage histogram over x finds
-    the emptiest column in [0.35·W, 0.62·W]; if its coverage is near zero and both
-    sides hold substantial text, that x is the divider. This distinguishes a real
-    two-column supplement page (empty gutter) from a hanging-number layout
-    (number at x≈108, text at x≈144, body at x≈72 — no gutter, lines span the
-    centre). Reading order is left column fully, then right column."""
+
+def _looks_single_column(lines: list[Line], span: float) -> bool:
+    """True when most lines run the full width of the region — no gutter can
+    exist, and saying so early keeps single-column pages cheap to analyse."""
+    if span <= 0:
+        return True
+    wide = sum(1 for l in lines if (l.x1 - l.x0) >= 0.75 * span)
+    return wide >= 0.5 * len(lines)
+
+
+def _has_simple_gutter(group: list[Line]) -> bool:
+    """Does this group itself hold two text columns? A COARSE, non-recursive
+    test: recursing into `_gutter_candidates` here is exponential (it evaluates
+    a candidate per divider position, each of which would evaluate its own), and
+    on A/RES/39/246 that ran 220,000 candidate evaluations and never finished."""
+    n = len(group)
+    if n < 2 * MIN_COL_LINES:
+        return False
+    xmin = min(l.x0 for l in group)
+    xmax = max(l.x1 for l in group)
+    span = xmax - xmin
+    if span <= 0:
+        return False
+    d = xmin + 0.15 * span
+    stop = xmax - 0.15 * span
+    while d <= stop:
+        left = [l for l in group if l.x1 <= d]
+        right = [l for l in group if l.x0 >= d]
+        d += 6.0
+        if len(left) < MIN_COL_LINES or len(right) < MIN_COL_LINES:
+            continue
+        a = _percentile([l.x1 for l in left], 0.95)
+        b = _percentile([l.x0 for l in right], 0.05)
+        if b - a < MIN_GUTTER_PT:
+            continue
+        lw, rw = a - xmin, xmax - b
+        if lw < MIN_COL_WIDTH_FRAC * span or rw < MIN_COL_WIDTH_FRAC * span:
+            continue
+        if _fills_column(left, lw) and _fills_column(right, rw):
+            return True
+    return False
+
+
+def _is_column_like(group: list[Line], width: float,
+                    cache: dict | None = None) -> bool:
+    """A side of a candidate split is admissible if it is a text column — or if
+    it is itself several columns, which is how a 3-column page is recognised."""
+    if _fills_column(group, width):
+        return True
+    key = (len(group), id(group[0]), id(group[-1])) if group else (0, 0, 0)
+    if cache is not None and key in cache:
+        return cache[key]
+    val = _has_simple_gutter(group)
+    if cache is not None:
+        cache[key] = val
+    return val
+
+
+def _gutter_candidates(lines: list[Line], depth: int = 0
+                       ) -> list[tuple[float, list[Line], list[Line], list[Line]]]:
+    """All viable column splits of a region, as (gutter_width, left, right, straddles).
+
+    A candidate divider is tested at every line edge in the central part of the
+    region. `left`/`right` are the lines entirely on one side; `straddles` are
+    the lines whose box spans the divider. The gutter is the true empty strip
+    between the two sides (max left edge → min right edge), so its width is a
+    measured whitespace valley, not a histogram artefact."""
     n = len(lines)
-    if n < 12:
-        _set_edges(lines)
-        return [_row_sort(lines)]
-    bin_w = 4.0
-    nbins = int(page_width / bin_w) + 2
-    cov = [0] * nbins
+    if n < 2 * MIN_COL_LINES:
+        return []
+    xmin = min(l.x0 for l in lines)
+    xmax = max(l.x1 for l in lines)
+    span = xmax - xmin
+    if span <= 0:
+        return []
+    # The divider is scanned continuously, not only at line edges: a single
+    # stray glyph poking out of a column must not be able to close the gutter.
+    # Its width is measured with percentiles for the same reason.
+    lo, hi = xmin + 0.15 * span, xmax - 0.15 * span
+    out: list[tuple[float, list[Line], list[Line], list[Line]]] = []
+    seen: set[tuple[int, int, int]] = set()
+    colcache: dict = {}
+    d = lo
+    while d <= hi:
+        left = [l for l in lines if l.x1 <= d]
+        right = [l for l in lines if l.x0 >= d]
+        cross = [l for l in lines if l.x0 < d < l.x1]
+        d += 2.0
+        if len(left) < MIN_COL_LINES or len(right) < MIN_COL_LINES:
+            continue
+        if len(left) < MIN_COL_SHARE * n or len(right) < MIN_COL_SHARE * n:
+            continue
+        if len(cross) > MAX_CROSS_SHARE * n:
+            continue
+        key = (len(left), len(right), len(cross))
+        if key in seen:
+            continue
+        a = _percentile([l.x1 for l in left], 0.95)
+        b = _percentile([l.x0 for l in right], 0.05)
+        gw = b - a
+        if gw < MIN_GUTTER_PT or gw > MAX_GUTTER_FRAC * span:
+            continue
+        lw, rw = a - xmin, xmax - b
+        if lw < MIN_COL_WIDTH_FRAC * span or rw < MIN_COL_WIDTH_FRAC * span:
+            continue
+        if not (_is_column_like(left, lw, colcache)
+                and _is_column_like(right, rw, colcache)):
+            continue
+        seen.add(key)
+        out.append((gw, left, right, cross))
+    return out
+
+
+def _stamp_soft_divider(lines: list[Line]) -> bool:
+    """Mark the most plausible column boundary of a region the cutter could not
+    split, so paragraph reconstruction still refuses to weld across it.
+
+    This is the "refuse rather than invent" path: the region will be read by
+    visual row (which may fragment paragraphs), but no paragraph will span the
+    boundary, so no sentence is manufactured out of two columns."""
+    n = len(lines)
+    if n < 2 * MIN_COL_LINES:
+        return False
+    xmin = min(l.x0 for l in lines)
+    xmax = max(l.x1 for l in lines)
+    span = xmax - xmin
+    if span <= 0 or _looks_single_column(lines, span):
+        return False
+    best: tuple[int, float, float] | None = None
+    d = xmin + 0.30 * span
+    while d <= xmin + 0.70 * span:
+        left = [l for l in lines if l.x1 <= d]
+        right = [l for l in lines if l.x0 >= d]
+        cross = sum(1 for l in lines if l.x0 < d < l.x1)
+        if (len(left) >= MIN_COL_LINES and len(right) >= MIN_COL_LINES
+                and cross <= 0.5 * n):
+            a = _percentile([l.x1 for l in left], 0.95)
+            b = _percentile([l.x0 for l in right], 0.05)
+            if b - a >= MIN_GUTTER_PT and (best is None or cross < best[0]):
+                best = (cross, (a + b) / 2, b - a)
+        d += 2.0
+    if best is None:
+        return False
     for l in lines:
-        a = int(l.x0 / bin_w)
-        b = int(min(l.x1, page_width) / bin_w)
-        for k in range(max(a, 0), min(b, nbins - 1) + 1):
-            cov[k] += 1
-    maxc = max(cov) or 1
-    lo, hi = int(0.35 * page_width / bin_w), int(0.62 * page_width / bin_w)
-    gutter = min(range(lo, hi), key=lambda k: cov[k]) if hi > lo else lo
-    divider = gutter * bin_w
-    col_l = [l for l in lines if (l.x0 + l.x1) / 2 < divider]
-    col_r = [l for l in lines if (l.x0 + l.x1) / 2 >= divider]
-    if cov[gutter] <= 0.06 * maxc and len(col_l) >= 0.2 * n and len(col_r) >= 0.2 * n:
-        _set_edges(col_l)
-        _set_edges(col_r)
-        return [_row_sort(col_l), _row_sort(col_r)]
-    _set_edges(lines)
-    return [_row_sort(lines)]
+        l.soft_divider = best[1]
+    return True
+
+
+def _y_cut_candidates(lines: list[Line]) -> list[int]:
+    """Indices (in y order) after which the region has a full-width blank band.
+
+    Used only when a columnar reading is available but dirty: a page whose top
+    half is a wide table and whose bottom half is two text columns has no single
+    divider, and must be cut horizontally first."""
+    order = sorted(lines, key=lambda l: (l.y0, l.x0))
+    heights = [l.y1 - l.y0 for l in order]
+    min_gap = max(6.0, 1.4 * (_median(heights) or 10.0))
+    out: list[tuple[float, int]] = []
+    run_y1 = order[0].y1
+    for i in range(len(order) - 1):
+        run_y1 = max(run_y1, order[i].y1)
+        gap = order[i + 1].y0 - run_y1
+        if gap >= min_gap:
+            out.append((gap, i))
+    out.sort(reverse=True)
+    return [i for _, i in out[:4]]
+
+
+def _xy_cut(lines: list[Line], flags: set[str], depth: int = 0) -> list[list[Line]]:
+    """Recursively cut a region into reading-ordered groups (see module notes)."""
+    if depth >= MAX_CUT_DEPTH or len(lines) < 2 * MIN_COL_LINES:
+        if depth >= MAX_CUT_DEPTH and _stamp_soft_divider(lines):
+            flags.add("layout_ambiguous_columns")
+        return [_row_sort(lines)]
+    xmin = min(l.x0 for l in lines)
+    span = max(l.x1 for l in lines) - xmin
+    if span <= 0 or _looks_single_column(lines, span):
+        return [_row_sort(lines)]      # nothing to cut, and cheap to say so
+    cands = _gutter_candidates(lines, depth)
+    if any(not c[3] for c in cands):
+        pass  # a clean vertical split exists: take it below, never cut sideways
+    else:
+        # Every divider is straddled. Before falling back to bands, try a
+        # HORIZONTAL cut at a full-width blank band: a page that is a table over
+        # two text columns has no single divider, but each half has one.
+        order = sorted(lines, key=lambda l: (l.y0, l.x0))
+        for i in (_y_cut_candidates(lines) if depth <= MAX_Y_CUT_DEPTH else []):
+            top, bot = order[:i + 1], order[i + 1:]
+            if len(top) < MIN_COL_LINES or len(bot) < MIN_COL_LINES:
+                continue
+            rt = _xy_cut(top, flags, depth + 1)
+            rb = _xy_cut(bot, flags, depth + 1)
+            if len(rt) > 1 or len(rb) > 1:
+                return rt + rb
+    if not cands:
+        if _stamp_soft_divider(lines):
+            flags.add("layout_ambiguous_columns")
+        return [_row_sort(lines)]
+    # FEWEST straddling lines wins — a true column boundary is one almost no line
+    # crosses, and a wide gap that 40 lines span is a ragged margin, not a
+    # gutter. Ties break to the widest gutter, then the most balanced split.
+    gw, left, right, cross = max(
+        cands, key=lambda c: (-len(c[3]), round(c[0], 1),
+                              min(len(c[1]), len(c[2]))))
+    if not cross:
+        return _xy_cut(left, flags, depth + 1) + _xy_cut(right, flags, depth + 1)
+
+    # Straddling lines cut the region into horizontal bands, read in place.
+    crossing = {id(l) for l in cross}
+    bands: list[tuple[str, list[Line]]] = []
+    for l in sorted(lines, key=lambda l: (l.y0, l.x0)):
+        kind = "full" if id(l) in crossing else "band"
+        if bands and bands[-1][0] == kind:
+            bands[-1][1].append(l)
+        else:
+            bands.append((kind, [l]))
+    if not any(k == "band" and len(g) >= 2 * MIN_COL_LINES for k, g in bands):
+        # No band is large enough to be worth splitting: the straddles run
+        # through the body, so neither a columnar nor a row reading is safe.
+        # Refuse to choose — but remember where the boundary probably is, so
+        # paragraph reconstruction still never welds the two sides together.
+        flags.add("layout_ambiguous_columns")
+        midpoint = (_percentile([l.x1 for l in left], 0.95)
+                    + _percentile([l.x0 for l in right], 0.05)) / 2
+        for l in lines:
+            l.soft_divider = midpoint
+        return [_row_sort(lines)]
+    mid = (_percentile([l.x1 for l in left], 0.95)
+           + _percentile([l.x0 for l in right], 0.05)) / 2
+    out: list[list[Line]] = []
+    for kind, group in bands:
+        if kind == "full":
+            out.append(_row_sort(group))
+            continue
+        if len(group) < 2 * MIN_COL_LINES:
+            # A band too small to analyse on its own INHERITS the boundary its
+            # parent found, so a three-line stretch of two columns is not welded
+            # together just because three lines are too few to detect a gutter.
+            if len({(l.x0 + l.x1) / 2 < mid for l in group}) > 1:
+                for l in group:
+                    l.soft_divider = mid
+        out.extend(_xy_cut(group, flags, depth + 1))
+    return out
+
+
+def page_divider(groups: list[list[Line]]) -> float | None:
+    """The x of the first side-by-side boundary between two regions of a page.
+
+    Used to give the small-font footnote apparatus the same column geometry as
+    the body it sits under: a footnote zone is often too small (fewer than eight
+    lines) for column detection to run on its own, and without a boundary the
+    left column's footnote is glued to the right column's."""
+    for a, b in zip(groups, groups[1:]):
+        ax1 = _percentile([l.x1 for l in a], 0.95)
+        bx0 = _percentile([l.x0 for l in b], 0.05)
+        if bx0 - ax1 >= MIN_GUTTER_PT:
+            return (ax1 + bx0) / 2
+    return None
+
+
+def split_columns(lines: list[Line], page_width: float,
+                  flags: set[str] | None = None) -> list[list[Line]]:
+    """Return reading-ordered line groups for one page, with per-group edges."""
+    if flags is None:
+        flags = set()
+    if not lines:
+        return []
+    groups = [g for g in _xy_cut(lines, flags) if g]
+    for g in groups:
+        _set_edges(g)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +942,16 @@ OPENING_RE = re.compile(
 OP_NUM_RE = re.compile(r"^\(?\s*(\d{1,3})\s*\.\s+\S")
 OP_PAREN_RE = re.compile(r"^\(\s*([A-Za-z]{1,7}|\d{1,3})\s*\)\s+\S")
 MEETING_RE = re.compile(r"^\[?\s*\d+\s*(st|nd|rd|th|II\b|d\b)?\s*(plenary\s+)?meeting\b", re.I)
-ADOPTED_RE = re.compile(r"^\[?\s*Adopted\b", re.I)
+# An ADOPTION RECORD, not any sentence containing the word. This used to be
+# `re.I`, so a preambular clause whose paragraph happened to begin with the
+# lowercase word "adopted" ("adopted at its sixtieth session a declaration …")
+# ended the crop: 145 documents were stored at ~21% of their source, and
+# A/RES/701(VII) — Korea, reports of the United Nations Korean Reconstruction
+# Agency — was stored as ONE row of 47 characters, its title line. Case-
+# sensitive, and the record is a short standalone line ("Adopted at the 1518th
+# plenary meeting", "Adopted unanimously", "Adopted by 96 votes to none").
+ADOPTED_RE = re.compile(
+    r"^\[?\s*Adopted\b(?:\s+(?:at|by|on|unanimously|without)\b.{0,120})?\s*[.\]]?\s*$")
 DATE_RE = re.compile(r"^\d{1,2}\s+[A-Za-z]+\s+\d{4}\.?\s*$")
 PREAMBULAR_FIRST = frozenset("""
 recalling reaffirming noting recognizing recognising welcoming considering
@@ -411,7 +964,15 @@ realizing supporting invoking highlighting confident hopeful resolved eager
 grateful pleased sharing aiming inspired""".split())
 # resolution number heading (old GA/ECOSOC "1260 (XIII)."; SC "338 (1973).";
 # modern "48/23.") — used to find neighbour boundaries.
-HEADING_ROMAN_RE = re.compile(r"^\(?\s*(\d{1,4})\s*\(\s*([A-Za-z0-9]{1,8})\s*\)\s*\.")
+# The session in parentheses is whatever the printer set and OCR mangled —
+# '(XIII)', '(ES-II)', '(S-IV)', '(XXI l)'. Keying on its SHAPE lost the boundary
+# on every special-session volume, so A/RES/1005(ES-II) could not see that
+# '1004 (ES-II).' was a different resolution and served 1004, 1007 and 1008 as
+# its own. Only the NUMBER is matched; the trailing period is required so that a
+# cross-reference ("resolution 1002 (ES-I) of 7 November 1956") is not a heading.
+HEADING_ROMAN_RE = re.compile(
+    r"^\(?\s*(?:Resolutions?\s+)?(\d{1,4})\s*[A-Z]?\s*[\(\[]([^)\]]{1,14})[\)\]]"
+    r"(?:\s*[.．]|\s*$)")
 HEADING_SLASH_RE = re.compile(r"^\s*([A-Z]?-?\d{1,4})/(\d{1,4}[A-Za-z]*)\s*\.")
 HEADING_SC_RE = re.compile(r"^\s*Resolution\s+(\d{1,4})\s*\(\s*(\d{4})\s*\)", re.I)
 DECISION_HEAD_RE = re.compile(r"^Decisions?\s*$", re.I)
@@ -586,18 +1147,76 @@ def _structural_start(text: str) -> bool:
 class Para:
     lines: list[Line] = field(default_factory=list)
     override: str | None = None   # forced text (hanging-marker merge)
+    hyph: "HyphenPolicy | None" = None   # document's hyphenation evidence
 
     @property
     def text(self) -> str:
-        return self.override if self.override is not None else _join_lines(self.lines)
+        if self.override is not None:
+            return self.override
+        return _join_lines(self.lines, self.hyph)
 
     @property
     def x0(self) -> float:
         return self.lines[0].x0
 
 
-def _join_lines(lines: list[Line]) -> str:
-    """Join a paragraph's lines, repairing conservative end-of-line hyphenation."""
+SIDE_BY_SIDE_GAP = 20.0     # pt; wider than any inter-word or marker gap
+
+
+def _side_by_side(prev: Line, ln: Line) -> bool:
+    """True when two lines sit on the same printed row with a wide gap between
+    them — separate table cells, or the two halves of an unsplit two-column
+    region. Never true for consecutive lines of a paragraph, which are on
+    different rows."""
+    if ln.page != prev.page:
+        return False
+    height = max(prev.y1 - prev.y0, 4.0)
+    if abs(ln.y0 - prev.y0) > 0.5 * height:
+        return False
+    # Either order: reading a column back up the page lands the next line to the
+    # LEFT of the previous one, which is the wrap of a failed column split.
+    gap = max(ln.x0 - prev.x1, prev.x0 - ln.x1)
+    if gap > SIDE_BY_SIDE_GAP:
+        return True
+    # Overlapping boxes on the same row are contradictory geometry (a full-width
+    # line lying across a column line): not one sentence either.
+    shorter = min(prev.x1 - prev.x0, ln.x1 - ln.x0, 1e9)
+    return gap < -0.2 * max(shorter, 1.0)
+
+
+def _continues_across_columns(prev: Line, first: Line) -> bool:
+    """Newspaper continuation: may the last line of one column/page be joined to
+    the first line of the next?
+
+    The bar is deliberately high, because a wrong JOIN invents a sentence while a
+    wrong SPLIT only costs a paragraph boundary. All of the following must hold:
+      * the previous line ends mid-word (hyphen) or mid-clause (no terminal
+        punctuation at all — not even a comma, which in UN drafting ends a
+        preambular paragraph);
+      * that line FILLS its column (a short last line means the paragraph ended);
+      * the next line is not a structural start and is not first-line indented.
+    """
+    t = (prev.text or "").rstrip()
+    nt = (first.text or "").strip()
+    if not t or not nt:
+        return False
+    hyphen_break = t.endswith("-") and len(t) >= 2 and t[-2].isalpha()
+    if not hyphen_break:
+        if not t[-1:].isalnum():
+            return False               # any punctuation ends it
+        if prev.cright and prev.x1 < prev.cright - 6:
+            return False               # short line => paragraph ended
+    if _structural_start(nt):
+        return False
+    if first.cleft and first.x0 > first.cleft + 7:
+        return False                   # indented => a new paragraph
+    if nt[:1].isupper() and not hyphen_break:
+        return False                   # a capital opens a new sentence/heading
+    return True
+
+
+def _join_lines(lines: list[Line], hyph: "HyphenPolicy | None" = None) -> str:
+    """Join a paragraph's lines, resolving end-of-line hyphenation on evidence."""
     out = ""
     for i, ln in enumerate(lines):
         t = ln.text
@@ -605,8 +1224,11 @@ def _join_lines(lines: list[Line]) -> str:
             out = t
             continue
         if out.endswith("-") and len(out) >= 2 and out[-2].isalpha() and t[:1].islower():
-            # soft wrap hyphen: "avoid-" + "ing" -> "avoiding" (next starts lower)
-            out = out[:-1] + t
+            policy = hyph or _default_hyphen()
+            if policy.keep_hyphen(out, t):
+                out = out.rstrip() + t.lstrip()      # 'self-' + 'determination'
+            else:
+                out = out[:-1] + t.lstrip()          # 'avoid-' + 'ing'
         else:
             out = out.rstrip() + " " + t.lstrip()
     return out
@@ -635,7 +1257,8 @@ _LONE_HEADING_RE = re.compile(
 
 
 def reconstruct_paragraphs(col_lines: list[list[Line]],
-                           marker_repair_log: list[tuple[str, str]] | None = None
+                           marker_repair_log: list[tuple[str, str]] | None = None,
+                           hyph: "HyphenPolicy | None" = None,
                            ) -> tuple[list[Para], float, float]:
     """Group ordered lines into paragraphs. Returns (paras, col_left, col_right).
 
@@ -661,22 +1284,45 @@ def reconstruct_paragraphs(col_lines: list[list[Line]],
     paras: list[Para] = []
     prev: Line | None = None
     for col in col_lines:
+        first_of_group = True
         for ln in col:
             start = False
             if prev is None:
                 start = True
+            elif first_of_group:
+                # COLUMN / REGION BOUNDARY. Default is a paragraph break: gluing
+                # two columns together is how fabricated sentences were made.
+                # Only the newspaper continuation rule may override it.
+                start = not _continues_across_columns(prev, ln)
             elif _structural_start(ln.text):
                 start = True
             elif ln.page != prev.page:
                 start = True
-            elif ln.y0 - prev.y1 > 1.6 * med_gap and ln.page == prev.page:
+            elif (ln.soft_divider
+                  and ((prev.x0 + prev.x1) / 2 < ln.soft_divider)
+                  != ((ln.x0 + ln.x1) / 2 < ln.soft_divider)):
+                # An unresolved column boundary lies between these two lines.
+                start = True
+            elif _side_by_side(prev, ln):
+                # Two boxes on the SAME printed row, separated by a wide gap:
+                # table cells, or two columns of a region that could not be
+                # split. They are not one sentence, and joining them is how
+                # "TOTAL, PART I TOTAL, PART II" and column weaves are made.
+                start = True
+            elif (ln.page == prev.page
+                  and (ln.y0 - prev.y1 > 1.6 * med_gap
+                       or ln.y0 - prev.y1 > 2.0 * max(ln.y1 - ln.y0, 4.0))):
+                # …or an absolute drop of more than two line heights: in a
+                # sparse group (a handful of footnote or table lines) the median
+                # gap is itself huge, and a page-tall jump would pass 1.6×med.
                 start = True
             elif ln.x0 > ln.cleft + 7 and _terminal(prev.text):
                 start = True  # first-line indent after a completed sentence
             elif ln.size >= body_size + 1.5 and prev.size < body_size + 1.5:
                 start = True  # font jump into a heading
+            first_of_group = False
             if start:
-                paras.append(Para([ln]))
+                paras.append(Para([ln], hyph=hyph))
             else:
                 paras[-1].lines.append(ln)
             prev = ln
@@ -684,6 +1330,26 @@ def reconstruct_paragraphs(col_lines: list[list[Line]],
     if marker_repair_log is not None:
         paras = _repair_ocr_markers(paras, marker_repair_log)
     return _merge_hanging_markers(paras), col_left, col_right
+
+
+def _marker_adjacent(marker: Line, nxt: Line) -> bool:
+    """True when a bare marker line is physically attached to the line that
+    follows it — same page, and either on the same row just to its left, or
+    immediately above it in the same column.
+
+    Without this test any bare number anywhere in the document could be welded
+    onto an unrelated line: S/RES/661(1990) stored `'19. nationals or in their
+    territories which promote …'` because the page number '19' at the foot of
+    page 1 was merged into the first line of page 2. That is an operative
+    paragraph number that does not exist in the resolution — an invented fact,
+    not a lost one."""
+    if marker.page != nxt.page:
+        return False
+    h = max(marker.y1 - marker.y0, 4.0)
+    same_row = abs(nxt.y0 - marker.y0) <= 0.6 * h and -2.0 <= nxt.x0 - marker.x1 <= 40.0
+    below = (-0.5 * h <= nxt.y0 - marker.y1 <= 1.5 * h
+             and abs(nxt.x0 - marker.x0) <= 60.0)
+    return same_row or below
 
 
 def _merge_hanging_markers(paras: list[Para]) -> list[Para]:
@@ -694,19 +1360,21 @@ def _merge_hanging_markers(paras: list[Para]) -> list[Para]:
     while i < len(paras):
         p = paras[i]
         t = p.text.strip()
-        if _BARE_MARKER_RE.match(t) and i + 1 < len(paras):
+        if (_BARE_MARKER_RE.match(t) and i + 1 < len(paras)
+                and _marker_adjacent(p.lines[-1], paras[i + 1].lines[0])):
             nxt = paras[i + 1]
             # normalise "1" / "1)" -> "1."; keep "(a)" as-is
             marker = t if t.endswith((".", ")")) else t + "."
-            out.append(Para(p.lines + nxt.lines,
+            out.append(Para(p.lines + nxt.lines, hyph=p.hyph,
                             override=f"{marker} {nxt.text.lstrip()}"))
             i += 2
             continue
         # lone number-heading ('48/23.') + its title line on the next block
         if (_LONE_HEADING_RE.match(t) and i + 1 < len(paras)
-                and not _structural_start(paras[i + 1].text)):
+                and not _structural_start(paras[i + 1].text)
+                and _marker_adjacent(p.lines[-1], paras[i + 1].lines[0])):
             nxt = paras[i + 1]
-            out.append(Para(p.lines + nxt.lines,
+            out.append(Para(p.lines + nxt.lines, hyph=p.hyph,
                             override=f"{t} {nxt.text.lstrip()}"))
             i += 2
             continue
@@ -734,18 +1402,25 @@ def _target_matchers(symbol_normalized: str):
     if not m:
         return None, None
     rest = m.group(1)
+    # Every form may be printed with a leading 'Resolution' — the Official
+    # Records supplements set 'Resolution 1005 (ES-II)' on its own line. Without
+    # that alternative the target's own heading is invisible to the crop, which
+    # then falls back to a guess: A/RES/1005(ES-II) served resolutions 1004,
+    # 1007 and 1008 as its own text.
+    pre = r"^\(?\s*(?:Resolutions?\s+)?"
     mo = re.match(r"^(\d{1,4})\((\d{4})\)$", rest)          # S/RES/338(1973)
     if mo:
         num = mo.group(1)
-        return re.compile(rf"^\(?\s*(Resolution\s+)?{num}\s*\(\s*{mo.group(2)}"), num
+        return re.compile(pre + rf"{num}\s*\(\s*{mo.group(2)}"), num
     mo = re.match(r"^(\d{1,4})\(([A-Za-z0-9\-]+)\)$", rest)  # A/RES/1260(XIII)
     if mo:
         num = mo.group(1)
-        return re.compile(rf"^\(?\s*{num}\s*\("), num
+        return re.compile(pre + rf"{num}\s*[A-Z]?\s*\("), num
     mo = re.match(r"^([A-Z]?-?\d{1,4})/(\d{1,4}[A-Za-z]*)$", rest)  # 48/23, 1978/6, S-15/1
     if mo:
         sess, num = mo.group(1), mo.group(2)
-        return re.compile(rf"^\s*{re.escape(sess)}/{re.escape(num)}\s*\."), f"{sess}/{num}"
+        return (re.compile(pre + rf"{re.escape(sess)}/{re.escape(num)}\s*[.．]"),
+                f"{sess}/{num}")
     return None, None
 
 
@@ -765,14 +1440,33 @@ def _heading_number(text: str) -> str | None:
 def crop_to_target(paras: list[Para], symbol_normalized: str) -> CropResult:
     """Locate the target resolution inside a compilation excerpt.
 
-    Start at the target's own number heading; end at its adoption record (a
-    'Nth (plenary) meeting' / 'Adopted ...' line, plus a trailing date line) or at
-    the next resolution heading. If the anchor cannot be found, keep everything and
-    flag it — NEVER silently truncate."""
+    The printed extent of a resolution is [ its own number heading , the next
+    resolution's number heading ). Inside that, the crop may end early at the
+    target's own ADOPTION RECORD — but only when no further part of the same
+    resolution follows it (omnibus resolutions print A, B, C … each with its own
+    record).
+
+    Both boundaries have failed in production and both failures are recorded
+    here so they cannot come back:
+
+      * ENDING TOO EARLY. `ADOPTED_RE` was case-insensitive `^adopted`, so a
+        paragraph beginning with the ordinary word "adopted" closed the crop:
+        145 documents were stored at ~21% of their source and A/RES/701(VII)
+        was stored as its title line alone (47 characters).
+
+      * RUNNING PAST THE END. When the target's own heading could not be matched
+        the crop kept the WHOLE file, so A/RES/1005(ES-II) carried resolutions
+        1004, 1007 and 1008, and A/RES/529(VI) carried 526, 527, 528 and 530 —
+        other documents' text served under this symbol. When the file opens mid
+        target (its heading is on an earlier page), the target's tail is bounded
+        by the FIRST heading that belongs to someone else.
+    """
     flags: list[str] = []
     target_re, target_num = _target_matchers(symbol_normalized)
     texts = [p.text for p in paras]
     n = len(paras)
+    foreign = [i for i, t in enumerate(texts)
+               if (hn := _heading_number(t)) is not None and hn != target_num]
 
     start = 0
     anchor = False
@@ -788,19 +1482,25 @@ def crop_to_target(paras: list[Para], symbol_normalized: str) -> CropResult:
         elif matches:
             start, anchor = matches[0], True
     if not anchor:
-        # Fallback: a single opening formula and no confident neighbour → keep all.
-        openings = [i for i, t in enumerate(texts) if OPENING_RE.match(t)]
-        if len(openings) <= 1:
-            flags.append("crop_anchor_not_found_single_text")
-            return CropResult(0, n, False, flags)
-        # Multiple openings but no target heading match: start at the first opening's
-        # preceding heading if any, else keep all and flag (ambiguous).
-        flags.append("crop_anchor_not_found_multi_text")
+        # The target's own heading is not in this file (it opens mid-resolution,
+        # or OCR destroyed the heading). Keep the LEAD region: everything up to
+        # the first heading that is demonstrably a different resolution.
+        lead_end = next((i for i in foreign if i >= 2), None)
+        if lead_end is not None:
+            flags.append("crop_anchor_not_found_lead_region")
+            return CropResult(0, lead_end, False, flags)
+        flags.append("crop_anchor_not_found_whole_file")
         return CropResult(0, n, False, flags)
 
-    # Find crop end after the start.
+    # Find crop end after the start. The printed extent of a resolution ends at
+    # the NEXT resolution's heading, so that boundary wins whenever it exists.
+    # The document's own adoption record is only a fallback for the last (or
+    # only) resolution in the file: ending there whenever it appeared cost
+    # S/RES/245(1968) a third of its region, and an omnibus resolution prints one
+    # record per lettered part.
     end = n
     seen_opening = False
+    record_end: int | None = None
     for j in range(start + 1, n):
         t = texts[j]
         if OPENING_RE.match(t):
@@ -813,14 +1513,12 @@ def crop_to_target(paras: list[Para], symbol_normalized: str) -> CropResult:
         if seen_opening and (DECISION_HEAD_RE.match(t) or DECISION_BLOCK_RE.match(t)):
             end = j  # an SC 'Decision(s)' block (bare or narrative) after the body
             break
-        if seen_opening and (MEETING_RE.match(t) or ADOPTED_RE.match(t)):
-            # include the adoption record, plus a trailing date line if present
-            end = j + 1
-            if end < n and DATE_RE.match(texts[end]):
-                end += 1
-            break
-    if end == n and start == 0:
-        pass
+        if seen_opening and record_end is None and (MEETING_RE.match(t) or ADOPTED_RE.match(t)):
+            record_end = j + 1
+            if record_end < n and DATE_RE.match(texts[record_end]):
+                record_end += 1
+    if end == n and record_end is not None:
+        end = record_end
     if not seen_opening and end == n:
         flags.append("crop_no_opening_after_anchor")
     return CropResult(start, end, True, flags)
@@ -905,6 +1603,25 @@ class ExtractResult:
     marker_repairs: list[tuple[str, str]] = field(default_factory=list)
     leadverb_repairs: list[tuple[str, str]] = field(default_factory=list)
     french_dropped: int = 0
+    foreign_dropped_lines: list[str] = field(default_factory=list)
+    layout_flags: list[str] = field(default_factory=list)
+    hyphen: dict[str, int] = field(default_factory=dict)
+
+    def summary_note(self) -> str:
+        """One ledger line carrying every decision that removed or altered text,
+        so a drop is never counted only at run time (audit finding X3)."""
+        parts = [self.triage.summary()]
+        if self.hyphen:
+            parts.append("hyphen kept=%d dropped=%d (doc=%d corpus=%d prefix=%d "
+                         "default=%d)" % (
+                             self.hyphen.get("kept", 0), self.hyphen.get("dropped", 0),
+                             self.hyphen.get("doc", 0), self.hyphen.get("corpus", 0),
+                             self.hyphen.get("prefix", 0), self.hyphen.get("default", 0)))
+        if self.french_dropped:
+            parts.append(f"lang_dropped_lines={self.french_dropped}")
+        if self.layout_flags:
+            parts.append("layout=" + ",".join(self.layout_flags))
+        return " | ".join(parts)
 
 
 def extract_pdf(path: Path, symbol_normalized: str) -> ExtractResult:
@@ -932,26 +1649,34 @@ def extract_pdf(path: Path, symbol_normalized: str) -> ExtractResult:
     body_lines = [l for l in kept if l.size >= body_size - 1.5]
     foot_lines = [l for l in kept if l.size < body_size - 1.5]
 
-    # Drop facing-language (French) lines from the old bilingual supplement
-    # volumes: kept only when they carry >=3 French function words, so a real
-    # two-column English/French page yields a contiguous English body (the French
-    # column no longer interleaves in reading order and truncates the crop).
-    n_before = len(body_lines) + len(foot_lines)
-    body_lines = [l for l in body_lines if not french_line(l.text)]
-    foot_lines = [l for l in foot_lines if not french_line(l.text)]
-    french_dropped = n_before - len(body_lines) - len(foot_lines)
+    # This document's own within-line spellings decide its line-break hyphens.
+    hyph = HyphenPolicy()
+    hyph.observe(kept)
 
-    # per-page column split, then concatenate pages in order
+    # LAYOUT: per page, cut into reading-ordered regions (columns and bands).
+    layout_flags: set[str] = set()
     col_groups: list[list[Line]] = []
     n_columns = 1
     for i in range(len(page_heights)):
         pls = [l for l in body_lines if l.page == i]
-        cols = split_columns(pls, page_widths.get(i, 622.0))
+        cols = split_columns(pls, page_widths.get(i, 622.0), layout_flags)
         n_columns = max(n_columns, len(cols))
         col_groups.extend(cols)
+        # the footnote apparatus inherits the body's column boundary
+        divider = page_divider(cols)
+        if divider is not None:
+            for l in foot_lines:
+                if l.page == i:
+                    l.soft_divider = divider
+
+    # FACING-LANGUAGE: the old GA/ECOSOC supplements print English and French
+    # side by side. The French is a whole COLUMN, so the decision is made per
+    # region and per document — never per line, which is how 1,003 English lines
+    # naming French-titled NGOs were deleted from 39 monolingual documents.
+    col_groups, foreign_lines = drop_foreign_regions(col_groups, layout_flags)
 
     marker_repairs: list[tuple[str, str]] = []
-    paras, _col_left, _col_right = reconstruct_paragraphs(col_groups, marker_repairs)
+    paras, _col_left, _col_right = reconstruct_paragraphs(col_groups, marker_repairs, hyph)
     # Repair OCR-garbled opening formulas so the parser's state machine anchors,
     # and OCR-garbled first-word lead verbs (first word only, verbatim body).
     leadverb_repairs: list[tuple[str, str]] = []
@@ -968,24 +1693,42 @@ def extract_pdf(path: Path, symbol_normalized: str) -> ExtractResult:
                                      lv.split(None, 1)[0]))
     crop = crop_to_target(paras, symbol_normalized)
     rows = build_rows(paras, crop, tri)
-    rows = _append_footnote_rows(rows, foot_lines, page_widths, tri)
+    # Footnotes are appended after the cropped body, so they used to escape the
+    # crop entirely and carry the neighbouring resolutions' apparatus into this
+    # document. Keep only the pages the cropped body actually occupies.
+    body_pages = {l.page for p in paras[crop.start:crop.end] for l in p.lines}
+    if body_pages:
+        foot_lines = [l for l in foot_lines if l.page in body_pages]
+    rows, foot_foreign = _append_footnote_rows(rows, foot_lines, page_widths, tri,
+                                               hyph, layout_flags)
+    foreign_lines += foot_foreign
     return ExtractResult(tri, rows, dropped, crop, n_columns,
                          marker_repairs=marker_repairs,
                          leadverb_repairs=leadverb_repairs,
-                         french_dropped=french_dropped)
+                         french_dropped=len(foreign_lines),
+                         foreign_dropped_lines=foreign_lines,
+                         layout_flags=sorted(layout_flags),
+                         hyphen={"kept": hyph.kept, "dropped": hyph.dropped,
+                                 **hyph.decisions})
 
 
 def _append_footnote_rows(rows: list[dict], foot_lines: list[Line],
-                          page_widths: dict[int, float], tri: Triage) -> list[dict]:
+                          page_widths: dict[int, float], tri: Triage,
+                          hyph: "HyphenPolicy | None" = None,
+                          flags: set[str] | None = None,
+                          ) -> tuple[list[dict], list[str]]:
     """Reconstruct footnote paragraphs from the small-font lines and append them
     as kind='footnote' rows after the cropped body (document order preserved)."""
+    if flags is None:
+        flags = set()
     if not foot_lines:
-        return rows
+        return rows, []
     groups: list[list[Line]] = []
     for i in sorted(page_widths):
         pls = [l for l in foot_lines if l.page == i]
-        groups.extend(split_columns(pls, page_widths.get(i, 622.0)))
-    fparas, _, _ = reconstruct_paragraphs(groups)
+        groups.extend(split_columns(pls, page_widths.get(i, 622.0), flags))
+    groups, foreign = drop_foreign_regions(groups, flags)
+    fparas, _, _ = reconstruct_paragraphs(groups, None, hyph)
     pos = rows[-1]["position"] + 1 if rows else 0
     for p in fparas:
         if not p.text.strip():
@@ -994,7 +1737,7 @@ def _append_footnote_rows(rows: list[dict], foot_lines: list[Line],
                              {"pdf": True, "textlayer_score": tri.klass,
                               "size": round(_median([l.size for l in p.lines]), 1)}))
         pos += 1
-    return rows
+    return rows, foreign
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1815,7 @@ def main() -> int:
     all_marker_repairs: list[tuple[str, str, str]] = []
     all_leadverb_repairs: list[tuple[str, str, str]] = []
     all_french: list[tuple[str, int]] = []
+    all_layout_flags: list[tuple[str, list[str]]] = []
 
     for start in range(0, len(targets), BATCH_DOCS):
         chunk = targets[start:start + BATCH_DOCS]
@@ -1100,12 +1844,14 @@ def main() -> int:
                         all_leadverb_repairs.append((symbol, b, a))
                     if res.french_dropped:
                         all_french.append((symbol, res.french_dropped))
+                    if res.layout_flags:
+                        all_layout_flags.append((symbol, res.layout_flags))
                     write_document(conn, symbol, lang, res.rows)
                     err = None
                     if res.crop and res.crop.flags:
                         err = "; ".join(res.crop.flags)[:400]
                         flagged.append((symbol, res.crop.flags))
-                    note = f"{res.triage.summary()}"
+                    note = res.summary_note()
                     upsert_document_file(conn, symbol, lang, status="extracted",
                                          error=(f"{note} | {err}" if err else note)[:500])
                     conn.commit()
@@ -1139,9 +1885,13 @@ def main() -> int:
     print(f"Lead-verb repairs fired: {len(all_leadverb_repairs)} (audit)")
     for sym, b, a in all_leadverb_repairs:
         print(f"  {sym:<22} {b!r} -> {a!r}")
-    print(f"French facing-language lines dropped in {len(all_french)} doc(s):")
+    print(f"Facing-language regions dropped in {len(all_french)} doc(s):")
     for sym, n in all_french:
         print(f"  {sym:<22} dropped {n} line(s)")
+    if all_layout_flags:
+        print(f"Layout flags on {len(all_layout_flags)} doc(s):")
+        for sym, fl in all_layout_flags[:40]:
+            print(f"  {sym:<22} {','.join(fl)}")
     print(f"Done. ok={ok} no_text={no_text} failed={failed} rows_written={total_rows}")
     return 0 if failed == 0 else 1
 
@@ -1155,8 +1905,14 @@ def _debug_dump(symbol: str, res: ExtractResult) -> None:
     if res.crop:
         print(f"  crop: start={res.crop.start} end={res.crop.end} "
               f"anchor_found={res.crop.anchor_found} flags={res.crop.flags}")
+    if res.layout_flags:
+        print(f"  layout flags: {res.layout_flags}")
+    if res.hyphen:
+        print(f"  hyphen: {res.hyphen}")
     if res.french_dropped:
-        print(f"  french lines dropped: {res.french_dropped}")
+        print(f"  facing-language lines dropped: {res.french_dropped}")
+        for t in res.foreign_dropped_lines[:8]:
+            print(f"     - {t[:80]}")
     for b, a in res.marker_repairs:
         print(f"  marker repair: {b!r} -> {a!r}")
     for b, a in res.leadverb_repairs:
@@ -1171,10 +1927,68 @@ def _debug_dump(symbol: str, res: ExtractResult) -> None:
         print(f"   [{r['position']:>3}] {tag:<4} {r['text'][:96]}")
 
 
-def _mk_para(text: str, x0: float = 80.0) -> Para:
-    ln = Line(text=text, x0=x0, x1=x0 + 200, y0=0, y1=10, size=9.5, bold=False,
-              italic=False, lead_italic_text=None, page=0)
+_MK_PARA_Y = [0.0]
+
+
+def _mk_para(text: str, x0: float = 80.0, y0: float | None = None) -> Para:
+    """A one-line paragraph with realistic stacked geometry (13pt pitch)."""
+    if y0 is None:
+        y0 = _MK_PARA_Y[0]
+        _MK_PARA_Y[0] += 13.0
+    ln = Line(text=text, x0=x0, x1=x0 + 200, y0=y0, y1=y0 + 11.0, size=9.5,
+              bold=False, italic=False, lead_italic_text=None, page=0)
     return Para([ln])
+
+
+def _mk_line(text: str, x0: float, y0: float, width: float | None = None,
+             page: int = 0, size: float = 9.5) -> Line:
+    """A synthetic text line. Width defaults to ~5pt per character at 9.5pt,
+    which is what these volumes actually set."""
+    w = width if width is not None else 5.0 * len(text)
+    return Line(text=text, x0=x0, x1=x0 + w, y0=y0, y1=y0 + 11.0, size=size,
+                bold=False, italic=False, lead_italic_text=None, page=page)
+
+
+def _mk_column(texts: list[str], x0: float, width: float, y0: float = 47.0,
+               pitch: float = 13.0, page: int = 0) -> list[Line]:
+    return [_mk_line(t, x0, y0 + i * pitch, width, page)
+            for i, t in enumerate(texts)]
+
+
+_LEFT_COL = [
+    "Convinced that all peoples have an inalienable right",
+    "to complete freedom, the exercise of their sovereignty",
+    "and the integrity of their national territory,",
+    "Solemnly proclaims the necessity of bringing to a",
+    "speedy and unconditional end colonialism in all its forms",
+    "and manifestations ;",
+    "1. The subjection of peoples to alien subjugation,",
+    "domination and exploitation constitutes a denial of",
+    "fundamental human rights, is contrary to the Charter",
+    "of the United Nations and is an impediment to the",
+    "promotion of world peace and co-operation.",
+    "2. All peoples have the right to self-determination;",
+]
+_RIGHT_COL = [
+    "any distinction as to race, creed or colour, in order to",
+    "enable them to enjoy complete independence and",
+    "freedom.",
+    "6. Any attempt aimed at the partial or total dis-",
+    "ruption of the national unity and the territorial in-",
+    "tegrity of a country is incompatible with the purposes",
+    "and principles of the Charter of the United Nations.",
+    "7. All States shall observe faithfully and strictly the",
+    "provisions of the Charter of the United Nations, the",
+    "Universal Declaration of Human Rights and the",
+    "present Declaration on the basis of equality,",
+    "non-interference in the internal affairs of all States.",
+]
+
+
+def _paragraph_texts(groups: list[list[Line]],
+                     hyph: HyphenPolicy | None = None) -> list[str]:
+    paras, _, _ = reconstruct_paragraphs(groups, None, hyph)
+    return [p.text for p in paras]
 
 
 def _self_test() -> int:
@@ -1224,15 +2038,416 @@ def _self_test() -> int:
     if paras[1].text != "II." or paras[3].text != "III.":
         fails.append(f"case3: roman heading mutated -> {paras[1].text!r},{paras[3].text!r}")
 
+    n_cases = 4 + _layout_controls(fails) + _hyphen_controls(fails) \
+        + _language_controls(fails) + _real_document_control(fails) \
+        + _crop_controls(fails) + _performance_control(fails) \
+        + _marker_controls(fails)
+
     for name, msg in ([("FAIL", m) for m in fails]):
         print(f"  {name}: {msg}")
     if fails:
-        print(f"self-test: {len(fails)} FAILED")
+        print(f"self-test: {len(fails)} of {n_cases} FAILED")
         return 1
-    print("self-test: all 4 adversarial cases passed "
-          "(unconfirmed 'I.' preserved, confirmed 'I.'->'1.', body 'Recallinx' "
-          "untouched, roman 'II.'/'III.' survived)")
+    print(f"self-test: all {n_cases} adversarial cases passed")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Negative controls — each is an input the code is PROVEN to handle, including
+# inputs that are deliberately pathological. A control that has never been shown
+# to fail is absent, not passing, so every one of these was run against the
+# pre-fix code first and reproduced the defect it now forbids.
+# ---------------------------------------------------------------------------
+
+def _layout_controls(fails: list[str]) -> int:
+    """Column geometry: 2-column, 3-column, header-over-columns, table-over-
+    columns, a single-column hanging-marker page that must NOT be split, and a
+    page whose columns cannot be separated at all — where the requirement is
+    that text from two columns is never merged into one paragraph."""
+    W = 622.0
+
+    # (1) Plain two-column page -> exactly two groups, left read first, and no
+    #     paragraph mixing the columns. Pre-fix this produced
+    #     'inalienable right any distinction as to race'.
+    lines = _mk_column(_LEFT_COL, 62, 236) + _mk_column(_RIGHT_COL, 322, 226)
+    flags: set[str] = set()
+    groups = split_columns(lines, W, flags)
+    if len(groups) != 2:
+        fails.append(f"layout1: two-column page split into {len(groups)} groups")
+    elif groups[0][0].text != _LEFT_COL[0] or groups[1][0].text != _RIGHT_COL[0]:
+        fails.append("layout1: two-column page not read left column first")
+    texts = _paragraph_texts(groups)
+    if any("inalienable right any distinction" in t for t in texts):
+        fails.append("layout1: THE A/RES/1514(XV) FABRICATION WAS REPRODUCED")
+
+    # (2) Three columns -> three groups in left-to-right order.
+    cols = [[f"column {c} line {i} of running text here" for i in range(8)]
+            for c in range(3)]
+    lines = (_mk_column(cols[0], 60, 150) + _mk_column(cols[1], 235, 150)
+             + _mk_column(cols[2], 410, 150))
+    groups = split_columns(lines, W, set())
+    if len(groups) != 3:
+        fails.append(f"layout2: three-column page split into {len(groups)} groups")
+    elif [g[0].text for g in groups] != [c[0] for c in cols]:
+        fails.append(f"layout2: three columns out of order: {[g[0].text for g in groups]}")
+
+    # (3) Full-width heading above two columns -> [heading][left][right].
+    head = [_mk_line("Resolutions adopted on the reports of the First Committee",
+                     100, 20, 420)]
+    lines = head + _mk_column(_LEFT_COL, 62, 236, y0=47) \
+        + _mk_column(_RIGHT_COL, 322, 226, y0=47)
+    groups = split_columns(lines, W, set())
+    if len(groups) != 3 or groups[0][0].text != head[0].text:
+        fails.append(f"layout3: header over two columns gave {len(groups)} groups, "
+                     f"first={groups[0][0].text[:30]!r}")
+
+    # (4) A wide table ABOVE two text columns: no single divider fits both, so
+    #     the page must be cut horizontally first. This is A/RES/32/1, which
+    #     pre-fix stored 50 characters of woven text.
+    table: list[Line] = []
+    for r in range(6):
+        y = 20 + r * 13
+        table += [_mk_line(f"32/{r}", 70, y, 30), _mk_line("Title of the resolution", 120, y, 260),
+                  _mk_line("14 December 1977", 450, y, 90)]
+    lines = table + _mk_column(_LEFT_COL, 62, 236, y0=140) \
+        + _mk_column(_RIGHT_COL, 322, 226, y0=140)
+    groups = split_columns(lines, W, set())
+    texts = _paragraph_texts(groups)
+    if any("inalienable right any distinction" in t for t in texts):
+        fails.append("layout4: table-over-columns page wove the two text columns")
+
+    # (5) A single-column page with hanging markers must NOT be split: the
+    #     marker gutter is not a column gutter.
+    lines = []
+    for i in range(14):
+        y = 50 + i * 13
+        if i % 4 == 0:
+            lines.append(_mk_line(f"{i//4 + 1}.", 100, y, 12))
+            lines.append(_mk_line("Requests the Secretary-General to report on the matter", 130, y, 400))
+        else:
+            lines.append(_mk_line("continuation of the operative paragraph running full width", 72, y, 458))
+    groups = split_columns(lines, W, set())
+    if len(groups) != 1:
+        fails.append(f"layout5: hanging-marker single column was split into {len(groups)}")
+
+    # (6b) A TABLE: cells on one row, wide apart. Each cell is its own block of
+    #      text; welding them produced
+    #      'BUDGET APPROPRIATIONS FOR 1972 TOTAL, PART I TOTAL, PART II'.
+    rows_t: list[Line] = []
+    for r in range(6):
+        y = 40 + r * 14
+        rows_t += [_mk_line(f"Section {r}", 70, y, 90),
+                   _mk_line(f"{r}00 000", 300, y, 60),
+                   _mk_line(f"{r}50 000", 460, y, 60)]
+    texts = _paragraph_texts([_row_sort(rows_t)])
+    welded = [t for t in texts if "Section" in t and t.count("000") > 1]
+    if welded:
+        fails.append(f"layout6b: table cells welded into one paragraph: {welded[0][:80]!r}")
+
+    # (6c) A hanging marker whose OCR box starts BELOW its own text line must
+    #      still be read first: '(a)' landed inside the word it labels
+    #      ('the Elimi- (a) nation of Discrimination').
+    marker_page = [
+        _mk_line("(a)", 62, 103, 14),
+        _mk_line("The provisions of the Declaration on the Elimi-", 90, 100, 200),
+        _mk_line("nation of Discrimination against Women;", 90, 113, 200),
+        _mk_line("(b)", 62, 129, 14),
+        _mk_line("The provisions of the International Covenant on", 90, 126, 200),
+        _mk_line("Economic, Social and Cultural Rights;", 90, 139, 200),
+    ]
+    texts = _paragraph_texts(split_columns(marker_page, W, set()))
+    if any("Elimi- (a)" in t or "Elimi-(a)" in t or "Eliminationof" in t for t in texts):
+        fails.append(f"layout6c: hanging marker read inside its own text: {texts!r}")
+    if not any(t.startswith("(a)") for t in texts):
+        fails.append(f"layout6c: the marker '(a)' did not lead its paragraph: {texts!r}")
+
+    # (6d) STAGGERED two columns that cannot be split (bridged on every row, and
+    #      the two columns' lines never share a row, so the same-row rule cannot
+    #      help): the boundary must still be remembered, or the columns weave.
+    left_run = [f"the Council has considered the situation number {i} and has"
+                for i in range(12)]
+    right_run = [f"whereas the Committee established under paragraph {i} shall"
+                 for i in range(12)]
+    stag: list[Line] = []
+    for i in range(12):
+        stag.append(_mk_line(left_run[i], 62, 47 + i * 26, 236))
+        stag.append(_mk_line(right_run[i], 322, 60 + i * 26, 226))
+    for k in range(0, 12, 2):
+        stag.append(_mk_line("a bridging line that spans the whole page width",
+                             62, 47 + k * 26 + 13, 486))
+    texts = _paragraph_texts(split_columns(stag, W, set()))
+    bad = [t for t in texts
+           if any(l in t for l in left_run[:3]) and any(r in t for r in right_run[:3])]
+    if bad:
+        fails.append(f"layout6d: staggered unsplittable columns merged: {bad[0][:90]!r}")
+
+    # (7) PATHOLOGICAL: two columns whose gutter is bridged on every third row,
+    #     so no clean split exists. The extractor may fragment, but it must NEVER
+    #     join the two columns into one paragraph.
+    lines = _mk_column(_LEFT_COL, 62, 236) + _mk_column(_RIGHT_COL, 322, 226)
+    for k in range(0, 12, 3):
+        lines.append(_mk_line("a bridging line that spans the whole page width",
+                              62, 47 + k * 13 + 4, 486))
+    flags = set()
+    groups = split_columns(lines, W, flags)
+    texts = _paragraph_texts(groups)
+    bad = [t for t in texts
+           if any(l in t for l in _LEFT_COL[:3]) and any(r in t for r in _RIGHT_COL[:3])]
+    if bad:
+        fails.append(f"layout7: unsplittable page merged both columns: {bad[0][:90]!r}")
+    return 9
+
+
+def _marker_controls(fails: list[str]) -> int:
+    """A bare number is only a paragraph marker if it is physically attached to
+    the line it labels. S/RES/661(1990) stored an invented operative paragraph
+    '19.' because the page number at the foot of page 1 was merged into the
+    first line of page 2."""
+    page_num = Para([_mk_line("19", 284, 738, 12, page=0)])
+    body = Para([_mk_line("nationals or in their territories which promote or are "
+                          "calculated to promote such sale or supply;", 62, 58, 240,
+                          page=1)])
+    out = _merge_hanging_markers([page_num, body])
+    if len(out) != 2 or out[1].text.startswith("19."):
+        fails.append(f"marker1: a page number was welded onto another page's line: "
+                     f"{out[-1].text[:70]!r}")
+    # …while a genuine hanging marker on the same row still merges.
+    marker = Para([_mk_line("4.", 62, 100, 12)])
+    clause = Para([_mk_line("Decides to remain seized of the matter.", 90, 100, 200)])
+    out = _merge_hanging_markers([marker, clause])
+    if len(out) != 1 or not out[0].text.startswith("4. Decides"):
+        fails.append(f"marker2: a genuine hanging marker stopped merging: "
+                     f"{[p.text for p in out]!r}")
+    return 2
+
+
+def _hyphen_controls(fails: list[str]) -> int:
+    """A line-break hyphen must survive in a compound and vanish in a broken
+    word, decided on evidence rather than on the next line's case."""
+    def joined(left: str, right: str, doc_lines: list[str] | None = None) -> str:
+        pol = HyphenPolicy(pairs={"peace": {}} and {})
+        if doc_lines:
+            pol.observe([_mk_line(t, 62, 47 + 13 * i, 236) for i, t in enumerate(doc_lines)])
+        return _join_lines([_mk_line(left, 62, 47, 236), _mk_line(right, 62, 60, 236)], pol)
+
+    # (1) The exact damage the audit proved: 'self-' + 'determination'.
+    if joined("the right to self-", "determination;") != "the right to self-determination;":
+        fails.append(f"hyphen1: self-determination destroyed -> "
+                     f"{joined('the right to self-', 'determination;')!r}")
+    # (2) A genuine syllable break must still close up.
+    if joined("the inter-", "national community") != "the international community":
+        fails.append(f"hyphen2: broken word not rejoined -> "
+                     f"{joined('the inter-', 'national community')!r}")
+    # (3) The document's own spelling decides an era-specific compound…
+    got = joined("economic co-", "operation among States",
+                 ["international economic co-operation is essential"])
+    if got != "economic co-operation among States":
+        fails.append(f"hyphen3: document evidence ignored -> {got!r}")
+    # (4) …in both directions.
+    got = joined("economic co-", "operation among States",
+                 ["international economic cooperation is essential"])
+    if got != "economic cooperation among States":
+        fails.append(f"hyphen4: document evidence ignored (join) -> {got!r}")
+    # (5) The corpus lexicon decides when the document is silent.
+    pol = HyphenPolicy(pairs={("peace", "keeping"): (500, 3)})
+    got = _join_lines([_mk_line("United Nations peace-", 62, 47, 236),
+                       _mk_line("keeping operations", 62, 60, 236)], pol)
+    if got != "United Nations peace-keeping operations":
+        fails.append(f"hyphen5: corpus lexicon ignored -> {got!r}")
+    pol = HyphenPolicy(pairs={("peace", "keeping"): (3, 500)})
+    got = _join_lines([_mk_line("United Nations peace-", 62, 47, 236),
+                       _mk_line("keeping operations", 62, 60, 236)], pol)
+    if got != "United Nations peacekeeping operations":
+        fails.append(f"hyphen6: corpus lexicon ignored (join) -> {got!r}")
+    return 6
+
+
+def _language_controls(fails: list[str]) -> int:
+    """The facing-language filter must delete a French COLUMN and must not touch
+    an English column that happens to name French-titled organizations — the
+    defect that removed 1,003 lines from 39 monolingual documents."""
+    english = [
+        "The Economic and Social Council, recalling its resolution 1996/31",
+        "of 25 July 1996 on the relationship between the United Nations and",
+        "non-governmental organizations, decides to grant consultative status",
+        "to the following organizations, on the recommendation of the Committee",
+        "Association pour le Deploiement Rural, la Protection de",
+        "l'Environnement et l'Artisanat (DERPREA - Cameroon)",
+        "Comite international pour le respect des droits de l'homme",
+        "Organisation pour la promotion de la femme et de l'enfant",
+        "Union des associations pour le developpement rural du Sahel",
+        "and decides further to review the list at its next session,",
+        "requests the Secretary-General to report on the implementation",
+        "of the present decision to the Council at its substantive session",
+    ]
+    french = [
+        "Le Conseil economique et social, rappelant sa resolution 1996/31 du",
+        "25 juillet 1996 relative aux relations aux fins de consultations entre",
+        "l'Organisation des Nations Unies et les organisations non",
+        "gouvernementales, decide d'admettre les organisations ci-apres au",
+        "statut consultatif, sur la recommandation du comite charge des",
+        "organisations non gouvernementales, et prie le secretaire general",
+        "de presenter un rapport sur l'application de la presente decision",
+        "au conseil lors de sa session de fond de l'annee prochaine,",
+        "et decide egalement d'examiner la liste des organisations dotees",
+        "du statut consultatif lors de sa prochaine session pleniere,",
+    ]
+    en_group = _mk_column(english, 62, 236)
+    fr_group = _mk_column(french, 322, 226)
+
+    # (1) Facing English/French columns: the French column goes, English stays.
+    flags: set[str] = set()
+    kept, dropped = drop_foreign_regions([en_group, fr_group], flags)
+    if len(kept) != 1 or kept[0] is not en_group:
+        fails.append(f"lang1: facing French column not dropped (kept {len(kept)} regions)")
+    if not any(t.startswith("Le Conseil") for t in dropped):
+        fails.append("lang1: French column text not recorded as dropped")
+
+    # (2) The SAME English column alone (a monolingual ECOSOC NGO decision):
+    #     nothing may be deleted, though it names five French-titled NGOs.
+    flags = set()
+    kept, dropped = drop_foreign_regions([en_group], flags)
+    if dropped or len(kept) != 1:
+        fails.append(f"lang2: monolingual English document lost {len(dropped)} lines "
+                     f"({dropped[:1]})")
+    # …and the old per-line predicate is shown to fire on exactly those lines,
+    # so control (2) is proven to be capable of failing.
+    if sum(1 for t in english if french_line(t)) < 3:
+        fails.append("lang2: control is toothless — the per-line predicate does "
+                     "not fire on the NGO names it was proven to delete")
+
+    # (3) An all-French document is kept whole and flagged, never emptied.
+    flags = set()
+    kept, dropped = drop_foreign_regions([fr_group], flags)
+    if dropped or "no_english_region_kept_whole" not in flags:
+        fails.append(f"lang3: French-only document was emptied ({len(dropped)} lines)")
+    return 3
+
+
+def _performance_control(fails: list[str]) -> int:
+    """A real page whose geometry made the layout analysis explode.
+
+    A/RES/39/246 ran 220,000 candidate evaluations and never finished, because
+    the column-likeness test recursed into candidate generation. Bounded now,
+    and this control is what will notice if it ever un-bounds."""
+    path = ARCHIVE_ROOT / "original" / "A_RES_39_246.pdf"
+    if not path.exists():
+        return 0
+    import time
+    t0 = time.time()
+    extract_pdf(path, "A/RES/39/246")
+    dt = time.time() - t0
+    if dt > 8.0:
+        fails.append(f"perf: A/RES/39/246 took {dt:.1f}s (bar 8s) — the layout "
+                     f"analysis is superlinear again")
+    return 1
+
+
+def _crop_controls(fails: list[str]) -> int:
+    """The crop must cover the document's own printed extent — and only it.
+
+    Both directions have cost real text: `ADOPTED_RE` as case-insensitive
+    `^adopted` cut 145 documents to ~21% of source (A/RES/701(VII) was stored as
+    47 characters), and an unmatched heading made A/RES/1005(ES-II) serve
+    resolutions 1004, 1007 and 1008 as its own."""
+    # (a) UNIT control, no archive needed: a preambular clause that merely uses
+    #     the word "adopted", and a resolution that is the LAST in its file (so
+    #     the adoption record, not a next heading, ends the crop).
+    _MK_PARA_Y[0] = 0.0
+    paras = [_mk_para("701 (VII). Korea: reports of the United Nations Agent General"),
+             _mk_para("The General Assembly,"),
+             _mk_para("Recalling the declaration on equality of opportunity"),
+             _mk_para("adopted at its sixtieth session by the International Labour "
+                      "Conference,"),
+             _mk_para("1. Reaffirms the objective of the United Nations to provide relief;"),
+             _mk_para("2. Requests the Secretary-General to report thereon;"),
+             _mk_para("410th plenary meeting,"),
+             _mk_para("1 December 1952.")]
+    crop = crop_to_target(paras, "A/RES/701(VII)")
+    kept = " ".join(p.text for p in paras[crop.start:crop.end])
+    if "Reaffirms the objective" not in kept or "Requests the Secretary-General" not in kept:
+        fails.append(f"crop-unit: the crop ended before the operative paragraphs "
+                     f"(kept {crop.start}:{crop.end})")
+    if "410th plenary meeting," not in kept:
+        fails.append("crop-unit: the adoption record was dropped")
+
+    # (b) UNIT control for the other direction: a second resolution in the same
+    #     file must never be carried, whatever its session is printed as.
+    _MK_PARA_Y[0] = 0.0
+    paras = [_mk_para("Resolution 1005 (ES-II)"),
+             _mk_para("The General Assembly,"),
+             _mk_para("Noting with deep concern that the provisions of its resolution "
+                      "1004 (ES-II) of 4 November 1956 have not been carried out,"),
+             _mk_para("1. Calls upon the Government of the Union of Soviet Socialist "
+                      "Republics to desist forthwith;"),
+             _mk_para("Resolution 1007 (ES-II)"),
+             _mk_para("The General Assembly,"),
+             _mk_para("Considering the extreme suffering to which the Hungarian people "
+                      "are subjected,")]
+    crop = crop_to_target(paras, "A/RES/1005(ES-II)")
+    kept = " ".join(p.text for p in paras[crop.start:crop.end])
+    if "extreme suffering" in kept or "Resolution 1007" in kept:
+        fails.append("crop-unit: the crop ran past this resolution into the next one")
+    if "Calls upon the Government" not in kept:
+        fails.append("crop-unit: the crop lost this resolution's own operative text")
+
+    cases = [
+        # symbol, min chars, phrase that must be present, phrase that must NOT be
+        ("A/RES/701(VII)", 800, "Reaffirms the objective of the United Nations", None),
+        ("A/RES/46/68", 10000, "American Samoa", None),
+        ("A/RES/1005(ES-II)", 1500, "The General Assembly", "extreme suffering"),
+        ("A/RES/357(IV)", 800, None, None),
+    ]
+    ran = 2
+    for symbol, min_chars, phrase, forbidden in cases:
+        path = ARCHIVE_ROOT / "original" / (sanitize_symbol(symbol) + ".pdf")
+        if not path.exists():
+            continue
+        ran += 1
+        res = extract_pdf(path, symbol)
+        text = " ".join(r["text"] for r in res.rows)
+        if len(text) < min_chars:
+            fails.append(f"crop[{symbol}]: {len(text)} chars stored, expected "
+                         f">= {min_chars} (crop ended early)")
+        if phrase and phrase not in text:
+            fails.append(f"crop[{symbol}]: {phrase!r} missing from the stored text")
+        if forbidden and forbidden in text:
+            fails.append(f"crop[{symbol}]: carries the NEXT resolution's text "
+                         f"({forbidden!r})")
+        # …and no row may print ANOTHER resolution's heading.
+        _, target_num = _target_matchers(symbol)
+        foreign = [r["text"][:60] for r in res.rows
+                   if (hn := _heading_number(r["text"] or "")) is not None
+                   and hn != target_num]
+        if foreign:
+            fails.append(f"crop[{symbol}]: carries another resolution's heading "
+                         f"{foreign[0]!r}")
+    if not ran:
+        print("  SKIPPED: crop controls need the archive (not mounted)")
+    return ran
+
+
+def _real_document_control(fails: list[str]) -> int:
+    """Run the real A/RES/1514(XV) scan if the archive is mounted: its preamble
+    must come out verbatim and its known fabrication must be absent. A missing
+    archive is reported as SKIPPED — silence must never read as success."""
+    path = ARCHIVE_ROOT / "original" / "A_RES_1514_XV_.pdf"
+    if not path.exists():
+        print(f"  SKIPPED: real-document control needs {path} (archive not mounted)")
+        return 0
+    res = extract_pdf(path, "A/RES/1514(XV)")
+    body = " ".join(r["text"] for r in res.rows if r["kind"] == "paragraph")
+    want = ("Convinced that all peoples have an inalienable right to complete "
+            "freedom, the exercise of their sovereignty and the integrity of "
+            "their national territory,")
+    if want not in body:
+        fails.append("real1: A/RES/1514(XV) preamble is not verbatim in the output")
+    for bad in ("inalienable right any distinction", "disspeedy", "inand"):
+        if bad in body:
+            fails.append(f"real1: A/RES/1514(XV) still contains {bad!r}")
+    if "self-determination" not in body:
+        fails.append("real2: A/RES/1514(XV) lost the hyphen in self-determination")
+    return 2
 
 
 if __name__ == "__main__":
